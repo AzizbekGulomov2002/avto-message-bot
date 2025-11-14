@@ -32,6 +32,8 @@ env/
 # Telegram sessions
 *.session
 *.session-journal
+bot/sessions/
+session_*.json
 
 # IDE
 .vscode/
