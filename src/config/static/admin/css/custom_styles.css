@@ -1,0 +1,38 @@
+/* Custom styles for Taxi Messenger Bot admin panel */
+
+/* Make login logo and site logo circular (oval) */
+.login-logo img,
+.site-logo img,
+.brand-image,
+.navbar-brand img,
+img[src*="taximessanger.png"] {
+    border-radius: 50% !important;
+    object-fit: cover;
+}
+
+/* Login page logo */
+.login-box .login-logo img,
+.login-box-msg .login-logo img {
+    border-radius: 50% !important;
+    width: 80px !important;
+    height: 80px !important;
+    object-fit: cover;
+}
+
+/* Sidebar brand logo */
+.brand-image,
+.main-sidebar .brand-image {
+    border-radius: 50% !important;
+    width: 40px !important;
+    height: 40px !important;
+    object-fit: cover;
+}
+
+/* Navbar logo */
+.navbar-brand img {
+    border-radius: 50% !important;
+    width: 40px !important;
+    height: 40px !important;
+    object-fit: cover;
+}
+

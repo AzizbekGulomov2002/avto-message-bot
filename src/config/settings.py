@@ -83,16 +83,16 @@ JAZZMIN_SETTINGS = {
     "site_title":    "Taxi Messenger Bot",
     "site_header":   "Taxi Messenger Bot",
     "site_brand":    "Taxi Messenger Bot",
-    "site_logo":     "/static/taximessanger.png",
+    "site_logo":     "images/taximessanger.png",
     "site_logo_classes": "img-circle",
-    "site_icon":     "/static/taximessanger.png",
-    "login_logo":    "/static/taximessanger.png",
-    "login_logo_dark": "/static/taximessanger.png",
+    "site_icon":     "images/taximessanger.png",
+    "login_logo":    "images/taximessanger.png",
+    "login_logo_dark": "images/taximessanger.png",
     "welcome_sign":  "Taxi Messenger Bot Admin Paneliga xush kelibsiz",
     "copyright":     "Taxi Messenger Bot",
 
     # Search & UI
-    "search_model": ["users.User", "users.UserPayment", "messages.ScheduledMessage"],
+    "search_model": ["users.User", "users.UserPayment", "messages.ScheduleInterval", "messages.DurationOption"],
     "show_sidebar": True,
     "related_modal_active": False,
     
@@ -107,9 +107,13 @@ JAZZMIN_SETTINGS = {
         "users.User": "fas fa-users",
         "users.UserPayment": "fas fa-credit-card",
         
-        # Messages
-        "messages.ScheduledMessage": "fas fa-paper-plane",
-        "messages.ScheduledMessageGroup": "fas fa-list",
+        # Messages App (Bot_Messages)
+        "messages": "fas fa-comments",
+        "bot_messages": "fas fa-comments",
+        
+        # Messages - Schedule intervals and duration options
+        "messages.ScheduleInterval": "fas fa-calendar-alt",
+        "messages.DurationOption": "fas fa-stopwatch",
         
         # Auth
         "auth.User": "fas fa-user-shield",
@@ -119,6 +123,9 @@ JAZZMIN_SETTINGS = {
     # Defaults
     "default_icon_parents":  "fas fa-chevron-circle-right",
     "default_icon_children": "fas fa-circle",
+    
+    # Custom CSS for circular logo
+    "custom_css": "admin/css/custom_styles.css",
 }
 
 JAZZMIN_UI_TWEAKS = {
@@ -163,7 +170,7 @@ USE_TZ = True
 STATIC_URL = '/static/'
 STATIC_ROOT = BASE_DIR / 'staticfiles'
 STATICFILES_DIRS = [
-    PROJECT_ROOT,  # Project root for taximessanger.png
+    BASE_DIR / 'static',  # Config static files (admin CSS, images)
 ]
 
 # Media files
