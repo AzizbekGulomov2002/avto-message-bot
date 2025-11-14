@@ -30,19 +30,48 @@ class User(models.Model):
         """Set status from boolean."""
         self.status = 1 if value else 0
     
+    @property
+    def is_authenticated(self):
+        """Return auth as boolean."""
+        return bool(self.auth)
+    
+    @is_authenticated.setter
+    def is_authenticated(self, value):
+        """Set auth from boolean."""
+        self.auth = 1 if value else 0
+    
     def get_status_display(self):
         """Get status display with icon."""
         if self.is_active:
             return format_html('<span style="color: green;">✓ Faol</span>')
         return format_html('<span style="color: red;">✗ Nofaol</span>')
+    
+    def get_auth_display(self):
+        """Get auth display with icon."""
+        if self.is_authenticated:
+            return format_html('<span style="color: green;">✓ Faol</span>')
+        return format_html('<span style="color: red;">✗ Nofaol</span>')
+    
+    def get_active_until_display(self):
+        """Get active_until display."""
+        if self.active_until:
+            from django.utils import timezone
+            from django.utils.formats import date_format
+            return date_format(self.active_until, "SHORT_DATETIME_FORMAT")
+        return "-"
 
 
 class UserAdminForm(forms.ModelForm):
-    """Custom form for User admin with is_active as BooleanField."""
+    """Custom form for User admin with is_active and is_authenticated as BooleanFields."""
     is_active = forms.BooleanField(
         label='Is Active',
         required=False,
         help_text='Check to activate user (status=1), uncheck to deactivate (status=0)'
+    )
+    is_authenticated = forms.BooleanField(
+        label='Is Authenticated',
+        required=False,
+        help_text='Check if user is authenticated (auth=1), uncheck if not authenticated (auth=0)'
     )
     
     class Meta:
@@ -53,11 +82,14 @@ class UserAdminForm(forms.ModelForm):
         super().__init__(*args, **kwargs)
         if self.instance and self.instance.pk:
             self.fields['is_active'].initial = bool(self.instance.status)
+            self.fields['is_authenticated'].initial = bool(self.instance.auth)
     
     def save(self, commit=True):
         instance = super().save(commit=False)
         if 'is_active' in self.cleaned_data:
             instance.status = 1 if self.cleaned_data['is_active'] else 0
+        if 'is_authenticated' in self.cleaned_data:
+            instance.auth = 1 if self.cleaned_data['is_authenticated'] else 0
         if commit:
             instance.save()
         return instance
@@ -67,14 +99,14 @@ class UserAdminForm(forms.ModelForm):
 class UserAdmin(admin.ModelAdmin):
     """User admin interface."""
     form = UserAdminForm
-    list_display = ('id', 'full_name', 'get_status_display', 'auth', 'active_until')
+    list_display = ('id', 'full_name', 'get_status_display', 'get_auth_display', 'get_active_until_display')
     list_filter = ('status', 'auth')
     search_fields = ('id', 'full_name')
-    readonly_fields = ('id', 'get_status_display')
+    readonly_fields = ('id', 'get_status_display', 'get_auth_display', 'get_active_until_display')
     
     fieldsets = (
         ('Basic Information', {
-            'fields': ('id', 'full_name', 'is_active', 'auth')
+            'fields': ('id', 'full_name', 'is_active', 'is_authenticated')
         }),
         ('Subscription', {
             'fields': ('active_until',)
@@ -86,4 +118,68 @@ class UserAdmin(admin.ModelAdmin):
         return obj.get_status_display()
     get_status_display.short_description = 'Status'
     get_status_display.admin_order_field = 'status'
+    
+    def get_auth_display(self, obj):
+        """Display auth in admin."""
+        return obj.get_auth_display()
+    get_auth_display.short_description = 'Auth'
+    get_auth_display.admin_order_field = 'auth'
+    
+    def get_active_until_display(self, obj):
+        """Display active_until in admin."""
+        return obj.get_active_until_display()
+    get_active_until_display.short_description = 'Active Until'
+    get_active_until_display.admin_order_field = 'active_until'
+    
+    def save_model(self, request, obj, form, change):
+        """Override save to send notification when status is changed."""
+        # Get old status if this is an update
+        old_status = None
+        if change and obj.pk:
+            try:
+                old_user = User.objects.get(pk=obj.pk)
+                old_status = old_user.status
+            except User.DoesNotExist:
+                pass
+        
+        # Save the user
+        super().save_model(request, obj, form, change)
+        
+        # Send notification if status changed
+        if old_status is not None and old_status != obj.status:
+            from .signals import send_telegram_message
+            if old_status == 0 and obj.status == 1:
+                # Status changed from inactive to active
+                message = "✅ Akkauntingiz aktiv qilindi, ishlatishingiz mumkin"
+                send_telegram_message(obj.id, message, show_menu=True)
+            elif old_status == 1 and obj.status == 0:
+                # Status changed from active to inactive
+                message = "❌ Sizning akkauntingiz no faol bo'ldi, admin bilan bog'laning: @system24admin"
+                send_telegram_message(obj.id, message)
+    
+    def delete_model(self, request, obj):
+        """Override delete to handle foreign key constraints."""
+        from django.db import connection
+        # Delete related data first (CASCADE should handle this, but doing it explicitly for safety)
+        with connection.cursor() as cursor:
+            # Delete related groups
+            cursor.execute("DELETE FROM groups WHERE user_id = %s", [obj.id])
+            # Delete related messages
+            cursor.execute("DELETE FROM messages WHERE user_id = %s", [obj.id])
+        # Then delete the user
+        super().delete_model(request, obj)
+    
+    def delete_queryset(self, request, queryset):
+        """Override bulk delete to handle foreign key constraints."""
+        from django.db import connection
+        # Delete related data first (CASCADE should handle this, but doing it explicitly for safety)
+        user_ids = list(queryset.values_list('id', flat=True))
+        if user_ids:
+            with connection.cursor() as cursor:
+                # Delete related groups
+                cursor.execute("DELETE FROM groups WHERE user_id = ANY(%s)", [user_ids])
+                # Delete related messages
+                cursor.execute("DELETE FROM messages WHERE user_id = ANY(%s)", [user_ids])
+        # Then delete the users
+        super().delete_queryset(request, queryset)
 

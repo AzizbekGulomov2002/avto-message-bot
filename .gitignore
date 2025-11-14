@@ -58,6 +58,8 @@ Thumbs.db
 __pycache__/
 *.pyc
 *.session
+./bot/sessions/*
+./bot/sessions/
 sessions/
 .env
 venv/
