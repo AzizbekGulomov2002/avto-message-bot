@@ -1,0 +1,45 @@
+python-messanger-bot/
+├── bot/                          # Telegram bot
+│   ├── __init__.py
+│   ├── config.py                # Konfiguratsiya
+│   ├── main.py                  # Asosiy bot fayli
+│   ├── handlers/                # Handlerlar
+│   │   ├── __init__.py
+│   │   ├── user_state.py        # Foydalanuvchi holati
+│   │   └── group_handler.py     # Guruhlar bilan ishlash
+│   ├── models/                  # Ma'lumotlar modellari
+│   │   ├── __init__.py
+│   │   ├── user.py
+│   │   └── scheduled_message.py
+│   └── storage/                 # Ma'lumotlar bazasi
+│       ├── __init__.py
+│       ├── database.py
+│       ├── user_storage.py
+│       └── scheduled_storage.py
+├── django_admin/                 # Django admin panel
+│   └── admin_panel/
+│       ├── manage.py
+│       ├── admin_panel/         # Django settings
+│       │   ├── __init__.py
+│       │   ├── settings.py
+│       │   ├── urls.py
+│       │   └── wsgi.py
+│       ├── users/               # Foydalanuvchilar
+│       │   ├── __init__.py
+│       │   ├── apps.py
+│       │   └── models.py
+│       ├── groups/              # Guruhlar
+│       │   ├── __init__.py
+│       │   ├── apps.py
+│       │   └── models.py
+│       └── messages/            # Xabarlar
+│           ├── __init__.py
+│           ├── apps.py
+│           └── models.py
+├── requirements.txt             # Python paketlari
+├── README.md                    # Hujjatlar
+├── SETUP.md                     # O'rnatish qo'llanmasi
+├── .env.example                 # Environment variables namunasi
+├── .gitignore                   # Git ignore fayli
+├── run_bot.sh                   # Botni ishga tushirish
+└── run_django.sh                # Django ni ishga tushirish
