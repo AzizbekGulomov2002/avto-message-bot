@@ -52,3 +52,13 @@ db.sqlite3-journal
 .DS_Store
 Thumbs.db
 
+
+__pycache__/
+*.pyc
+*.session
+sessions/
+.env
+venv/
+.env/
+.DS_Store
+
