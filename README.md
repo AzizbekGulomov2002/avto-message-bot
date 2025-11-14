@@ -95,7 +95,7 @@ python main.py
 ### Django admin panelni ishga tushirish
 
 ```bash
-cd django_admin/admin_panel
+cd src/config
 python manage.py migrate
 python manage.py createsuperuser
 python manage.py runserver
@@ -113,8 +113,8 @@ python-messanger-bot/
 │   ├── handlers/          # Bot handlerlari
 │   ├── models/            # Ma'lumotlar modellari
 │   └── storage/           # Ma'lumotlar bazasi operatsiyalari
-├── django_admin/          # Django admin panel
-│   └── admin_panel/
+├── src/                   # Django admin panel
+│   └── config/
 │       ├── users/         # Foydalanuvchilar modellari
 │       ├── groups/        # Guruhlar modellari
 │       └── messages/      # Xabarlar modellari

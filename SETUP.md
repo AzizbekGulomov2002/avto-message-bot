@@ -119,7 +119,7 @@ cd bot && python main.py
 Yangi terminal oynasida:
 
 ```bash
-cd django_admin/admin_panel
+cd src/config
 python manage.py migrate
 python manage.py createsuperuser
 python manage.py runserver
