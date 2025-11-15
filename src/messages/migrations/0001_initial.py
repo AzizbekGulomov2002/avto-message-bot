@@ -11,40 +11,82 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.CreateModel(
-            name='DurationOption',
-            fields=[
-                ('id', models.AutoField(primary_key=True, serialize=False)),
-                ('time', models.FloatField(help_text='Time value (e.g., 1, 2, 3)')),
-                ('time_type', models.CharField(choices=[('sekund', 'Sekund'), ('minut', 'Minut'), ('soat', 'Soat')], default='soat', help_text='Time unit: sekund, minut, or soat', max_length=20)),
-                ('display_order', models.IntegerField(default=0, help_text='Order in which to display this option')),
-                ('is_active', models.BooleanField(default=True, help_text='Whether this option is active')),
-                ('created_at', models.DateTimeField(auto_now_add=True)),
+        # Create DurationOption model state (managed=False, but create table if it doesn't exist)
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.CreateModel(
+                    name='DurationOption',
+                    fields=[
+                        ('id', models.AutoField(primary_key=True, serialize=False)),
+                        ('time', models.FloatField(help_text='Time value (e.g., 1, 2, 3)')),
+                        ('time_type', models.CharField(choices=[('sekund', 'Sekund'), ('minut', 'Minut'), ('soat', 'Soat')], default='soat', help_text='Time unit: sekund, minut, or soat', max_length=20)),
+                        ('display_order', models.IntegerField(default=0, help_text='Order in which to display this option')),
+                        ('is_active', models.BooleanField(default=True, help_text='Whether this option is active')),
+                        ('created_at', models.DateTimeField(auto_now_add=True)),
+                    ],
+                    options={
+                        'verbose_name': 'Duration Option',
+                        'verbose_name_plural': 'Duration Options',
+                        'db_table': 'duration_options',
+                        'ordering': ['display_order', 'time'],
+                        'managed': False,
+                    },
+                ),
             ],
-            options={
-                'verbose_name': 'Duration Option',
-                'verbose_name_plural': 'Duration Options',
-                'db_table': 'duration_options',
-                'ordering': ['display_order', 'time'],
-                'managed': False,
-            },
+            database_operations=[
+                # Create duration_options table if it doesn't exist
+                migrations.RunSQL(
+                    sql="""
+                        CREATE TABLE IF NOT EXISTS duration_options (
+                            id SERIAL PRIMARY KEY,
+                            time DOUBLE PRECISION NOT NULL,
+                            time_type VARCHAR(20) NOT NULL DEFAULT 'soat',
+                            display_order INTEGER NOT NULL DEFAULT 0,
+                            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """,
+                    reverse_sql="-- Cannot reverse table creation for managed=False model",
+                ),
+            ],
         ),
-        migrations.CreateModel(
-            name='ScheduleInterval',
-            fields=[
-                ('id', models.AutoField(primary_key=True, serialize=False)),
-                ('time', models.FloatField(help_text='Time value (e.g., 5, 10, 30)')),
-                ('time_type', models.CharField(choices=[('sekund', 'Sekund'), ('minut', 'Minut'), ('soat', 'Soat')], default='minut', help_text='Time unit: sekund, minut, or soat', max_length=20)),
-                ('display_order', models.IntegerField(default=0, help_text='Order in which to display this option')),
-                ('is_active', models.BooleanField(default=True, help_text='Whether this option is active')),
-                ('created_at', models.DateTimeField(auto_now_add=True)),
+        # Create ScheduleInterval model state (managed=False, but create table if it doesn't exist)
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.CreateModel(
+                    name='ScheduleInterval',
+                    fields=[
+                        ('id', models.AutoField(primary_key=True, serialize=False)),
+                        ('time', models.FloatField(help_text='Time value (e.g., 5, 10, 30)')),
+                        ('time_type', models.CharField(choices=[('sekund', 'Sekund'), ('minut', 'Minut'), ('soat', 'Soat')], default='minut', help_text='Time unit: sekund, minut, or soat', max_length=20)),
+                        ('display_order', models.IntegerField(default=0, help_text='Order in which to display this option')),
+                        ('is_active', models.BooleanField(default=True, help_text='Whether this option is active')),
+                        ('created_at', models.DateTimeField(auto_now_add=True)),
+                    ],
+                    options={
+                        'verbose_name': 'Schedule Interval',
+                        'verbose_name_plural': 'Schedule Intervals',
+                        'db_table': 'schedule_intervals',
+                        'ordering': ['display_order', 'time'],
+                        'managed': False,
+                    },
+                ),
             ],
-            options={
-                'verbose_name': 'Schedule Interval',
-                'verbose_name_plural': 'Schedule Intervals',
-                'db_table': 'schedule_intervals',
-                'ordering': ['display_order', 'time'],
-                'managed': False,
-            },
+            database_operations=[
+                # Create schedule_intervals table if it doesn't exist
+                migrations.RunSQL(
+                    sql="""
+                        CREATE TABLE IF NOT EXISTS schedule_intervals (
+                            id SERIAL PRIMARY KEY,
+                            time DOUBLE PRECISION NOT NULL,
+                            time_type VARCHAR(20) NOT NULL DEFAULT 'minut',
+                            display_order INTEGER NOT NULL DEFAULT 0,
+                            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                        );
+                    """,
+                    reverse_sql="-- Cannot reverse table creation for managed=False model",
+                ),
+            ],
         ),
     ]
