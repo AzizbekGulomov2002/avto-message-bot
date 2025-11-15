@@ -55,7 +55,7 @@ class Migration(migrations.Migration):
                 ),
             ],
             database_operations=[
-                # Create user_payments table manually
+                # Create user_payments table manually (without foreign key first)
                 migrations.RunSQL(
                     sql="""
                         CREATE TABLE IF NOT EXISTS user_payments (
@@ -63,11 +63,30 @@ class Migration(migrations.Migration):
                             payed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                             deadline DATE NOT NULL,
                             sum NUMERIC(10, 2) NOT NULL,
-                            user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE
+                            user_id BIGINT NOT NULL
                         );
                         CREATE INDEX IF NOT EXISTS user_payments_user_id_idx ON user_payments(user_id);
                     """,
                     reverse_sql="DROP TABLE IF EXISTS user_payments;",
+                ),
+                # Add foreign key constraint if users table exists
+                migrations.RunSQL(
+                    sql="""
+                        DO $$
+                        BEGIN
+                            IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'users') THEN
+                                IF NOT EXISTS (
+                                    SELECT 1 FROM information_schema.table_constraints 
+                                    WHERE constraint_name = 'user_payments_user_id_fkey'
+                                ) THEN
+                                    ALTER TABLE user_payments 
+                                    ADD CONSTRAINT user_payments_user_id_fkey 
+                                    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE;
+                                END IF;
+                            END IF;
+                        END $$;
+                    """,
+                    reverse_sql="ALTER TABLE user_payments DROP CONSTRAINT IF EXISTS user_payments_user_id_fkey;",
                 ),
             ],
         ),
