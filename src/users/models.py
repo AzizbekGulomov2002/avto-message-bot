@@ -162,7 +162,6 @@ class UserAdmin(admin.ModelAdmin):
         """Override delete to handle foreign key constraints and delete session."""
         from django.db import connection
         import os
-        import glob
         
         # Delete user's session files
         user_id = obj.id
@@ -180,12 +179,66 @@ class UserAdmin(admin.ModelAdmin):
             except Exception as e:
                 print(f"Error deleting session file {pattern}: {e}")
         
-        # Delete related data first (CASCADE should handle this, but doing it explicitly for safety)
+        # Delete related data first (only if tables exist)
         with connection.cursor() as cursor:
-            # Delete related groups
-            cursor.execute("DELETE FROM groups WHERE user_id = %s", [obj.id])
-            # Delete related messages
-            cursor.execute("DELETE FROM messages WHERE user_id = %s", [obj.id])
+            # Check if groups table exists and delete related groups
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'groups'
+                );
+            """)
+            groups_exists = cursor.fetchone()[0]
+            if groups_exists:
+                try:
+                    cursor.execute("DELETE FROM groups WHERE user_id = %s", [obj.id])
+                except Exception as e:
+                    print(f"Error deleting from groups table: {e}")
+            
+            # Check if messages table exists and delete related messages
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'messages'
+                );
+            """)
+            messages_exists = cursor.fetchone()[0]
+            if messages_exists:
+                try:
+                    cursor.execute("DELETE FROM messages WHERE user_id = %s", [obj.id])
+                except Exception as e:
+                    print(f"Error deleting from messages table: {e}")
+            
+            # Delete from scheduled_messages and related tables if they exist
+            cursor.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'scheduled_messages'
+                );
+            """)
+            scheduled_messages_exists = cursor.fetchone()[0]
+            if scheduled_messages_exists:
+                try:
+                    # Delete from scheduled_message_groups first (foreign key constraint)
+                    cursor.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables 
+                            WHERE table_name = 'scheduled_message_groups'
+                        );
+                    """)
+                    scheduled_groups_exists = cursor.fetchone()[0]
+                    if scheduled_groups_exists:
+                        cursor.execute("""
+                            DELETE FROM scheduled_message_groups 
+                            WHERE scheduled_id IN (
+                                SELECT id FROM scheduled_messages WHERE user_id = %s
+                            )
+                        """, [obj.id])
+                    # Delete from scheduled_messages
+                    cursor.execute("DELETE FROM scheduled_messages WHERE user_id = %s", [obj.id])
+                except Exception as e:
+                    print(f"Error deleting from scheduled_messages table: {e}")
+        
         # Then delete the user
         super().delete_model(request, obj)
     
@@ -211,12 +264,65 @@ class UserAdmin(admin.ModelAdmin):
                     except Exception as e:
                         print(f"Error deleting session file {pattern}: {e}")
             
-            # Delete related data first (CASCADE should handle this, but doing it explicitly for safety)
+            # Delete related data first (only if tables exist)
             with connection.cursor() as cursor:
-                # Delete related groups
-                cursor.execute("DELETE FROM groups WHERE user_id = ANY(%s)", [user_ids])
-                # Delete related messages
-                cursor.execute("DELETE FROM messages WHERE user_id = ANY(%s)", [user_ids])
+                # Check if groups table exists and delete related groups
+                cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'groups'
+                    );
+                """)
+                groups_exists = cursor.fetchone()[0]
+                if groups_exists:
+                    try:
+                        cursor.execute("DELETE FROM groups WHERE user_id = ANY(%s)", [user_ids])
+                    except Exception as e:
+                        print(f"Error deleting from groups table: {e}")
+                
+                # Check if messages table exists and delete related messages
+                cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'messages'
+                    );
+                """)
+                messages_exists = cursor.fetchone()[0]
+                if messages_exists:
+                    try:
+                        cursor.execute("DELETE FROM messages WHERE user_id = ANY(%s)", [user_ids])
+                    except Exception as e:
+                        print(f"Error deleting from messages table: {e}")
+                
+                # Delete from scheduled_messages and related tables if they exist
+                cursor.execute("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables 
+                        WHERE table_name = 'scheduled_messages'
+                    );
+                """)
+                scheduled_messages_exists = cursor.fetchone()[0]
+                if scheduled_messages_exists:
+                    try:
+                        # Delete from scheduled_message_groups first (foreign key constraint)
+                        cursor.execute("""
+                            SELECT EXISTS (
+                                SELECT FROM information_schema.tables 
+                                WHERE table_name = 'scheduled_message_groups'
+                            );
+                        """)
+                        scheduled_groups_exists = cursor.fetchone()[0]
+                        if scheduled_groups_exists:
+                            cursor.execute("""
+                                DELETE FROM scheduled_message_groups 
+                                WHERE scheduled_id IN (
+                                    SELECT id FROM scheduled_messages WHERE user_id = ANY(%s)
+                                )
+                            """, [user_ids])
+                        # Delete from scheduled_messages
+                        cursor.execute("DELETE FROM scheduled_messages WHERE user_id = ANY(%s)", [user_ids])
+                    except Exception as e:
+                        print(f"Error deleting from scheduled_messages table: {e}")
         # Then delete the users
         super().delete_queryset(request, queryset)
 
