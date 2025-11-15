@@ -302,6 +302,13 @@ class MessengerBot:
             self.user_storage.insert_user(user_id)
             user = self.user_storage.get_user(user_id)
         
+        # Check if user was retrieved successfully
+        if not user:
+            logger.error(f"[START] Failed to retrieve user {user_id} after insertion")
+            print(f"[START] Failed to retrieve user {user_id} after insertion")
+            await update.message.reply_text("⚠️ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
+            return
+        
         # Check authentication first (regardless of status)
         if user.auth == 0:
             # Need authentication - this is required for all users
