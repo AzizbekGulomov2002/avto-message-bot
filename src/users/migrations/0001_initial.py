@@ -12,37 +12,63 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        # Create User model first (managed=False, table already exists in DB)
-        migrations.CreateModel(
-            name='User',
-            fields=[
-                ('id', models.BigIntegerField(primary_key=True, serialize=False)),
-                ('auth', models.IntegerField(default=0)),
-                ('status', models.IntegerField(default=0)),
-                ('full_name', models.CharField(blank=True, max_length=200, null=True)),
-                ('active_until', models.DateTimeField(blank=True, null=True)),
+        # Create User model state only (managed=False, table already exists in DB)
+        # We use SeparateDatabaseAndState to avoid creating the table
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.CreateModel(
+                    name='User',
+                    fields=[
+                        ('id', models.BigIntegerField(primary_key=True, serialize=False)),
+                        ('auth', models.IntegerField(default=0)),
+                        ('status', models.IntegerField(default=0)),
+                        ('full_name', models.CharField(blank=True, max_length=200, null=True)),
+                        ('active_until', models.DateTimeField(blank=True, null=True)),
+                    ],
+                    options={
+                        'db_table': 'users',
+                        'managed': False,  # Table already exists, Django won't create it
+                    },
+                ),
             ],
-            options={
-                'db_table': 'users',
-                'managed': False,  # Table already exists, Django won't create it
-            },
+            database_operations=[],  # Don't create the table, it already exists
         ),
         # Create UserPayment model (managed=True, Django will create this table)
-        migrations.CreateModel(
-            name='UserPayment',
-            fields=[
-                ('id', models.AutoField(primary_key=True, serialize=False)),
-                ('payed_at', models.DateTimeField(auto_now_add=True)),
-                ('deadline', models.DateField()),
-                ('sum', models.DecimalField(decimal_places=2, max_digits=10)),
-                ('user', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='payments', to='users.user')),
+        migrations.SeparateDatabaseAndState(
+            state_operations=[
+                migrations.CreateModel(
+                    name='UserPayment',
+                    fields=[
+                        ('id', models.AutoField(primary_key=True, serialize=False)),
+                        ('payed_at', models.DateTimeField(auto_now_add=True)),
+                        ('deadline', models.DateField()),
+                        ('sum', models.DecimalField(decimal_places=2, max_digits=10)),
+                        ('user', models.ForeignKey(on_delete=django.db.models.deletion.CASCADE, related_name='payments', to='users.user')),
+                    ],
+                    options={
+                        'verbose_name': 'User Payment',
+                        'verbose_name_plural': 'User Payments',
+                        'db_table': 'user_payments',
+                        'ordering': ['-payed_at'],
+                        'managed': True,
+                    },
+                ),
             ],
-            options={
-                'verbose_name': 'User Payment',
-                'verbose_name_plural': 'User Payments',
-                'db_table': 'user_payments',
-                'ordering': ['-payed_at'],
-                'managed': True,
-            },
+            database_operations=[
+                # Create user_payments table manually
+                migrations.RunSQL(
+                    sql="""
+                        CREATE TABLE IF NOT EXISTS user_payments (
+                            id SERIAL PRIMARY KEY,
+                            payed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                            deadline DATE NOT NULL,
+                            sum NUMERIC(10, 2) NOT NULL,
+                            user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE
+                        );
+                        CREATE INDEX IF NOT EXISTS user_payments_user_id_idx ON user_payments(user_id);
+                    """,
+                    reverse_sql="DROP TABLE IF EXISTS user_payments;",
+                ),
+            ],
         ),
     ]
