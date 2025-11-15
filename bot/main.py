@@ -74,6 +74,9 @@ class MessengerBot:
         # Connect to database
         self.db.connect()
         
+        # Ensure required tables exist
+        self._ensure_tables_exist()
+        
         # Start periodic deactivation check
         self.scheduler.add_job(
             self._check_expired_users,
@@ -97,6 +100,105 @@ class MessengerBot:
             minutes=1,
             id='send_scheduled_messages'
         )
+    
+    def _ensure_tables_exist(self):
+        """Ensure required database tables exist."""
+        try:
+            conn = self.db.get_connection()
+            try:
+                with conn.cursor() as cur:
+                    # Check and create scheduled_messages table
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables 
+                            WHERE table_name = 'scheduled_messages'
+                        );
+                    """)
+                    exists = cur.fetchone()[0]
+                    
+                    if not exists:
+                        cur.execute("""
+                            CREATE TABLE IF NOT EXISTS scheduled_messages (
+                                id SERIAL PRIMARY KEY,
+                                user_id BIGINT NOT NULL,
+                                message TEXT NOT NULL,
+                                interval_minutes INTEGER NOT NULL,
+                                paused BOOLEAN NOT NULL DEFAULT FALSE,
+                                expires_at TIMESTAMPTZ,
+                                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                            );
+                        """)
+                        logger.info("✅ Created scheduled_messages table")
+                        print("✅ Created scheduled_messages table")
+                    
+                    # Check and create scheduled_message_groups table
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables 
+                            WHERE table_name = 'scheduled_message_groups'
+                        );
+                    """)
+                    exists = cur.fetchone()[0]
+                    
+                    if not exists:
+                        # Create table without foreign key first
+                        cur.execute("""
+                            CREATE TABLE IF NOT EXISTS scheduled_message_groups (
+                                scheduled_id INTEGER NOT NULL,
+                                group_id BIGINT NOT NULL,
+                                PRIMARY KEY (scheduled_id, group_id)
+                            );
+                        """)
+                        logger.info("✅ Created scheduled_message_groups table")
+                        print("✅ Created scheduled_message_groups table")
+                        
+                        # Add foreign key constraint if scheduled_messages exists
+                        cur.execute("""
+                            SELECT EXISTS (
+                                SELECT FROM information_schema.tables 
+                                WHERE table_name = 'scheduled_messages'
+                            );
+                        """)
+                        if cur.fetchone()[0]:
+                            cur.execute("""
+                                DO $$
+                                BEGIN
+                                    IF NOT EXISTS (
+                                        SELECT 1 FROM information_schema.table_constraints 
+                                        WHERE constraint_name = 'scheduled_message_groups_scheduled_id_fkey'
+                                    ) THEN
+                                        ALTER TABLE scheduled_message_groups 
+                                        ADD CONSTRAINT scheduled_message_groups_scheduled_id_fkey 
+                                        FOREIGN KEY (scheduled_id) REFERENCES scheduled_messages(id) ON DELETE CASCADE;
+                                    END IF;
+                                END $$;
+                            """)
+                    
+                    # Check and create user_last_groups table
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables 
+                            WHERE table_name = 'user_last_groups'
+                        );
+                    """)
+                    exists = cur.fetchone()[0]
+                    
+                    if not exists:
+                        cur.execute("""
+                            CREATE TABLE IF NOT EXISTS user_last_groups (
+                                user_id BIGINT NOT NULL PRIMARY KEY,
+                                group_ids BIGINT[] NOT NULL DEFAULT '{}'
+                            );
+                        """)
+                        logger.info("✅ Created user_last_groups table")
+                        print("✅ Created user_last_groups table")
+                    
+                    conn.commit()
+            finally:
+                self.db.put_connection(conn)
+        except Exception as e:
+            logger.error(f"Error ensuring tables exist: {e}")
+            print(f"Error ensuring tables exist: {e}")
     
     def _validate_telegram_credentials(self):
         """Validate APP_ID and APP_HASH credentials."""
