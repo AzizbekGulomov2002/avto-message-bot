@@ -20,6 +20,7 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     CallbackQueryHandler,
+    ChatMemberHandler,
     ContextTypes,
     filters,
 )
@@ -235,6 +236,8 @@ class MessengerBot:
         self.application.add_handler(CommandHandler("admin", self.handle_admin))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        # Handle user leaving/blocking the bot
+        self.application.add_handler(ChatMemberHandler(self.handle_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     
     async def _get_or_create_client(self, user_id: int) -> Optional[TelegramClient]:
         """Get or create Telegram client for user."""
@@ -470,6 +473,8 @@ class MessengerBot:
         # Handle authentication flow
         if state.step == "waiting_for_phone":
             state.phone = text
+            # Save phone number to database
+            self.user_storage.update_user_phone(user_id, text)
             # Send code request to user's phone
             code_sent = await self._send_code_request(user_id, text)
             if code_sent:
@@ -1776,6 +1781,59 @@ class MessengerBot:
         await self.application.start()
         await self.application.updater.start_polling(drop_pending_updates=True)
         logger.info("Bot started")
+    
+    async def handle_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle chat member updates (when user leaves/blocks the bot)."""
+        try:
+            chat_member = update.my_chat_member
+            if not chat_member:
+                return
+            
+            user_id = chat_member.from_user.id
+            new_status = chat_member.new_chat_member.status
+            
+            # Check if user left or blocked the bot
+            if new_status in ['left', 'kicked']:
+                logger.info(f"[CHAT MEMBER] User {user_id} left or blocked the bot. Deleting session.")
+                print(f"[CHAT MEMBER] User {user_id} left or blocked the bot. Deleting session.")
+                self._delete_user_session(user_id)
+        except Exception as e:
+            logger.error(f"Error handling chat member update: {e}", exc_info=True)
+    
+    def _delete_user_session(self, user_id: int):
+        """Delete user's session files."""
+        import os
+        from pathlib import Path
+        
+        try:
+            bot_dir = Path(__file__).resolve().parent
+            sessions_dir = bot_dir / "sessions"
+            
+            session_files = [
+                sessions_dir / f"session_{user_id}.json",
+                sessions_dir / f"tg_session_{user_id}.session",
+                sessions_dir / f"tg_session_{user_id}.session-journal",
+            ]
+            
+            for session_file in session_files:
+                try:
+                    if session_file.exists():
+                        os.remove(str(session_file))
+                        logger.info(f"[SESSION DELETE] Deleted {session_file}")
+                        print(f"[SESSION DELETE] Deleted {session_file}")
+                except Exception as e:
+                    logger.error(f"Error deleting session file {session_file}: {e}")
+                    print(f"Error deleting session file {session_file}: {e}")
+            
+            # Remove client from memory
+            with self.clients_lock:
+                if user_id in self.clients:
+                    del self.clients[user_id]
+                    logger.info(f"[SESSION DELETE] Removed client from memory for user {user_id}")
+                    print(f"[SESSION DELETE] Removed client from memory for user {user_id}")
+        except Exception as e:
+            logger.error(f"Error deleting user session: {e}", exc_info=True)
+            print(f"Error deleting user session: {e}")
     
     async def stop(self):
         """Stop the bot."""

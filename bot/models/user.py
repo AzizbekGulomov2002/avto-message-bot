@@ -11,6 +11,7 @@ class User:
     auth: int = 0
     status: int = 0
     full_name: Optional[str] = None
+    phone: Optional[str] = None
     active_until: Optional[datetime] = None
 
 

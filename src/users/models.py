@@ -11,6 +11,7 @@ class User(models.Model):
     auth = models.IntegerField(default=0)
     status = models.IntegerField(default=0)
     full_name = models.CharField(max_length=200, null=True, blank=True)
+    phone = models.CharField(max_length=20, null=True, blank=True)
     active_until = models.DateTimeField(null=True, blank=True)
     
     class Meta:
@@ -106,7 +107,7 @@ class UserAdmin(admin.ModelAdmin):
     
     fieldsets = (
         ('Basic Information', {
-            'fields': ('id', 'full_name', 'is_active', 'is_authenticated')
+            'fields': ('id', 'full_name', 'phone', 'is_active', 'is_authenticated')
         }),
         ('Subscription', {
             'fields': ('active_until',)
@@ -158,8 +159,27 @@ class UserAdmin(admin.ModelAdmin):
                 send_telegram_message(obj.id, message)
     
     def delete_model(self, request, obj):
-        """Override delete to handle foreign key constraints."""
+        """Override delete to handle foreign key constraints and delete session."""
         from django.db import connection
+        import os
+        import glob
+        
+        # Delete user's session files
+        user_id = obj.id
+        session_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'bot', 'sessions')
+        session_patterns = [
+            os.path.join(session_dir, f'session_{user_id}.json'),
+            os.path.join(session_dir, f'tg_session_{user_id}.session'),
+            os.path.join(session_dir, f'tg_session_{user_id}.session-journal'),
+        ]
+        
+        for pattern in session_patterns:
+            try:
+                if os.path.exists(pattern):
+                    os.remove(pattern)
+            except Exception as e:
+                print(f"Error deleting session file {pattern}: {e}")
+        
         # Delete related data first (CASCADE should handle this, but doing it explicitly for safety)
         with connection.cursor() as cursor:
             # Delete related groups
@@ -170,11 +190,28 @@ class UserAdmin(admin.ModelAdmin):
         super().delete_model(request, obj)
     
     def delete_queryset(self, request, queryset):
-        """Override bulk delete to handle foreign key constraints."""
+        """Override bulk delete to handle foreign key constraints and delete sessions."""
         from django.db import connection
-        # Delete related data first (CASCADE should handle this, but doing it explicitly for safety)
+        import os
+        
+        # Delete sessions for all users being deleted
         user_ids = list(queryset.values_list('id', flat=True))
         if user_ids:
+            session_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'bot', 'sessions')
+            for user_id in user_ids:
+                session_patterns = [
+                    os.path.join(session_dir, f'session_{user_id}.json'),
+                    os.path.join(session_dir, f'tg_session_{user_id}.session'),
+                    os.path.join(session_dir, f'tg_session_{user_id}.session-journal'),
+                ]
+                for pattern in session_patterns:
+                    try:
+                        if os.path.exists(pattern):
+                            os.remove(pattern)
+                    except Exception as e:
+                        print(f"Error deleting session file {pattern}: {e}")
+            
+            # Delete related data first (CASCADE should handle this, but doing it explicitly for safety)
             with connection.cursor() as cursor:
                 # Delete related groups
                 cursor.execute("DELETE FROM groups WHERE user_id = ANY(%s)", [user_ids])

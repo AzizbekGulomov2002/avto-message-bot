@@ -40,7 +40,7 @@ class UserStorage:
         """Get user by ID."""
         try:
             result = self.db.execute_query(
-                "SELECT id, auth, status, full_name, active_until FROM users WHERE id = %s",
+                "SELECT id, auth, status, full_name, phone, active_until FROM users WHERE id = %s",
                 (user_id,),
                 fetch_one=True
             )
@@ -50,6 +50,7 @@ class UserStorage:
                     auth=result['auth'],
                     status=result['status'],
                     full_name=result.get('full_name'),
+                    phone=result.get('phone'),
                     active_until=result.get('active_until')
                 )
             return None
@@ -86,6 +87,18 @@ class UserStorage:
             return True
         except Exception as e:
             print(f"Error updating full name: {e}")
+            return False
+    
+    def update_user_phone(self, user_id: int, phone: str) -> bool:
+        """Update user phone number."""
+        try:
+            self.db.execute_query(
+                "UPDATE users SET phone = %s WHERE id = %s",
+                (phone, user_id)
+            )
+            return True
+        except Exception as e:
+            print(f"Error updating phone: {e}")
             return False
     
     def update_user_active_until(self, user_id: int, active_until: Optional[datetime]) -> bool:

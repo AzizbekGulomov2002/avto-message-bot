@@ -36,10 +36,26 @@ class UsersConfig(AppConfig):
                             auth INTEGER DEFAULT 0,
                             status INTEGER DEFAULT 0,
                             full_name VARCHAR(200),
+                            phone VARCHAR(20),
                             active_until TIMESTAMPTZ
                         );
                     """)
                     connection.commit()
+                else:
+                    # Add phone column if it doesn't exist
+                    cursor.execute("""
+                        SELECT EXISTS (
+                            SELECT 1 FROM information_schema.columns 
+                            WHERE table_name = 'users' AND column_name = 'phone'
+                        );
+                    """)
+                    phone_exists = cursor.fetchone()[0]
+                    
+                    if not phone_exists:
+                        cursor.execute("""
+                            ALTER TABLE users ADD COLUMN phone VARCHAR(20);
+                        """)
+                        connection.commit()
         except Exception as e:
             # Log error but don't crash the app
             print(f"Warning: Could not ensure users table exists: {e}")

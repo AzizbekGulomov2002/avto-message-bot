@@ -17,8 +17,20 @@ class Migration(migrations.Migration):
                     auth INTEGER DEFAULT 0,
                     status INTEGER DEFAULT 0,
                     full_name VARCHAR(200),
+                    phone VARCHAR(20),
                     active_until TIMESTAMPTZ
                 );
+                
+                -- Add phone column if it doesn't exist
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns 
+                        WHERE table_name = 'users' AND column_name = 'phone'
+                    ) THEN
+                        ALTER TABLE users ADD COLUMN phone VARCHAR(20);
+                    END IF;
+                END $$;
             """,
             reverse_sql="-- Cannot reverse table creation for managed=False model",
         ),
