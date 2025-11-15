@@ -12,8 +12,8 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        # Create User model state only (managed=False, table already exists in DB)
-        # We use SeparateDatabaseAndState to avoid creating the table
+        # Create User model state only (managed=False, but create table if it doesn't exist)
+        # We use SeparateDatabaseAndState to create table if needed
         migrations.SeparateDatabaseAndState(
             state_operations=[
                 migrations.CreateModel(
@@ -27,11 +27,25 @@ class Migration(migrations.Migration):
                     ],
                     options={
                         'db_table': 'users',
-                        'managed': False,  # Table already exists, Django won't create it
+                        'managed': False,  # Django won't manage this table after creation
                     },
                 ),
             ],
-            database_operations=[],  # Don't create the table, it already exists
+            database_operations=[
+                # Create users table if it doesn't exist
+                migrations.RunSQL(
+                    sql="""
+                        CREATE TABLE IF NOT EXISTS users (
+                            id BIGINT NOT NULL PRIMARY KEY,
+                            auth INTEGER DEFAULT 0,
+                            status INTEGER DEFAULT 0,
+                            full_name VARCHAR(200),
+                            active_until TIMESTAMPTZ
+                        );
+                    """,
+                    reverse_sql="DROP TABLE IF EXISTS users;",
+                ),
+            ],
         ),
         # Create UserPayment model (managed=True, Django will create this table)
         migrations.SeparateDatabaseAndState(
