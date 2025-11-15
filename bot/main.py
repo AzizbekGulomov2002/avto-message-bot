@@ -699,15 +699,7 @@ class MessengerBot:
             if not state.selected_groups:
                 await query.message.reply_text("⚠️ Hech qanday guruh tanlanmadi!")
                 return
-            # After groups are selected, show schedule intervals first (Qancha vaqtda bir marta)
-            await self._show_schedule_intervals(chat_id, user_id)
-            return
-        
-        # Schedule interval selection
-        if data.startswith("select_interval_"):
-            interval_id = int(data.split("_")[2])
-            state.selected_interval_id = interval_id
-            # After interval is selected, show duration options (Qancha vaqt davomida)
+            # After groups are selected, show duration options first (Qancha vaqt davomida)
             await self._show_duration_options(chat_id, user_id)
             return
         
@@ -715,7 +707,15 @@ class MessengerBot:
         if data.startswith("select_duration_"):
             duration_id = int(data.split("_")[2])
             state.selected_duration_id = duration_id
-            # After duration is selected, save the scheduled message
+            # After duration is selected, show schedule intervals (Qancha vaqtda bir marta)
+            await self._show_schedule_intervals(chat_id, user_id)
+            return
+        
+        # Schedule interval selection
+        if data.startswith("select_interval_"):
+            interval_id = int(data.split("_")[2])
+            state.selected_interval_id = interval_id
+            # After interval is selected, save the scheduled message
             await self._save_scheduled_message(chat_id, user_id)
             return
         
