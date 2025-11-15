@@ -433,9 +433,8 @@ class MessengerBot:
             logger.info(f"[START] User {user_id} is authenticated but not activated (status=0)")
             print(f"[START] User {user_id} is authenticated but not activated (status=0)")
             await update.message.reply_text(
-                "Sizning akkauntingiz No Faol,\n\n"
-                "1. @useinfobot ga kirib, ID raqamingizni oling\n\n"
-                "2. admin bilan bog'laning: @system24admin"
+                "✅ Akkaunt ochildi siz uchun.\n\n"
+                "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
             )
             return
         
@@ -453,9 +452,8 @@ class MessengerBot:
         user = self.user_storage.get_user(user_id)
         if user and user.status == 0:
             await update.message.reply_text(
-                "Sizning akkauntingiz No Faol,\n\n"
-                "1. @useinfobot ga kirib, ID raqamingizni oling\n\n"
-                "2. admin bilan bog'laning: @system24admin"
+                "✅ Akkaunt ochildi siz uchun.\n\n"
+                "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
             )
             return
         
@@ -527,9 +525,8 @@ class MessengerBot:
                 else:
                     # User authenticated but not activated by admin (default status=0 for new users)
                     await update.message.reply_text(
-                        "Sizning akkauntingiz No Faol,\n\n"
-                        "1. @useinfobot ga kirib, ID raqamingizni oling\n\n"
-                        "2. admin bilan bog'laning: @system24admin"
+                        "✅ Akkaunt ochildi siz uchun.\n\n"
+                        "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
                     )
             elif result == "code_expired":
                 # Code expired, ask to resend
@@ -585,9 +582,8 @@ class MessengerBot:
                 else:
                     # User authenticated but not activated by admin (default status=0 for new users)
                     await update.message.reply_text(
-                        "Sizning akkauntingiz No Faol,\n\n"
-                        "1. @useinfobot ga kirib, ID raqamingizni oling\n\n"
-                        "2. admin bilan bog'laning: @system24admin"
+                        "✅ Akkaunt ochildi siz uchun.\n\n"
+                        "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
                     )
             else:
                 await update.message.reply_text(
@@ -612,9 +608,8 @@ class MessengerBot:
                 else:
                     # User authenticated but not activated by admin (default status=0 for new users)
                     await update.message.reply_text(
-                        "Sizning akkauntingiz No Faol,\n\n"
-                        "1. @useinfobot ga kirib, ID raqamingizni oling\n\n"
-                        "2. admin bilan bog'laning: @system24admin"
+                        "✅ Akkaunt ochildi siz uchun.\n\n"
+                        "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
                     )
             else:
                 await update.message.reply_text("❌ Ism bo'sh bo'lishi mumkin emas. Iltimos, ismingizni kiriting:")
@@ -642,7 +637,8 @@ class MessengerBot:
             elif user.status == 0:
                 # Authenticated but not active
                 await update.message.reply_text(
-                    "Sizning akkauntingiz No Faol, admin bilan bog'laning: @system24admin"
+                    "✅ Akkaunt ochildi siz uchun.\n\n"
+                    "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
                 )
                 return
             elif user.status == 1:

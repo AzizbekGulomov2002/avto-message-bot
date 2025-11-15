@@ -1,6 +1,7 @@
 """User models for Django admin."""
 from django.db import models
 from django.contrib import admin
+from django.contrib.admin import SimpleListFilter
 from django import forms
 from django.utils.html import format_html
 
@@ -62,6 +63,44 @@ class User(models.Model):
         return "-"
 
 
+class IsActiveFilter(SimpleListFilter):
+    """Custom filter for is_active status."""
+    title = 'Status (Faol/Nofaol)'
+    parameter_name = 'is_active'
+    
+    def lookups(self, request, model_admin):
+        return (
+            ('1', '✓ Faol'),
+            ('0', '✗ Nofaol'),
+        )
+    
+    def queryset(self, request, queryset):
+        if self.value() == '1':
+            return queryset.filter(status=1)
+        elif self.value() == '0':
+            return queryset.filter(status=0)
+        return queryset
+
+
+class IsAuthenticatedFilter(SimpleListFilter):
+    """Custom filter for is_authenticated status."""
+    title = 'Auth (Faol/Nofaol)'
+    parameter_name = 'is_authenticated'
+    
+    def lookups(self, request, model_admin):
+        return (
+            ('1', '✓ Faol'),
+            ('0', '✗ Nofaol'),
+        )
+    
+    def queryset(self, request, queryset):
+        if self.value() == '1':
+            return queryset.filter(auth=1)
+        elif self.value() == '0':
+            return queryset.filter(auth=0)
+        return queryset
+
+
 class UserAdminForm(forms.ModelForm):
     """Custom form for User admin with is_active and is_authenticated as BooleanFields."""
     is_active = forms.BooleanField(
@@ -101,7 +140,7 @@ class UserAdmin(admin.ModelAdmin):
     """User admin interface."""
     form = UserAdminForm
     list_display = ('id', 'full_name', 'get_status_display', 'get_auth_display', 'get_active_until_display')
-    list_filter = ('status', 'auth')
+    list_filter = (IsActiveFilter, IsAuthenticatedFilter)
     search_fields = ('id', 'full_name')
     readonly_fields = ('id', 'get_status_display', 'get_auth_display', 'get_active_until_display')
     
