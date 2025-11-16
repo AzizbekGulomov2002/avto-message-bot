@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from typing import Dict, Optional
 import pytz
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -235,6 +235,9 @@ class MessengerBot:
         self.application.add_handler(CommandHandler("start", self.handle_start))
         self.application.add_handler(CommandHandler("admin", self.handle_admin))
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
+        # Handle contact messages (phone number sharing)
+        self.application.add_handler(MessageHandler(filters.CONTACT, self.handle_contact))
+        # Handle text messages (but not commands)
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         # Handle user leaving/blocking the bot
         self.application.add_handler(ChatMemberHandler(self.handle_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
@@ -414,16 +417,25 @@ class MessengerBot:
             await update.message.reply_text("⚠️ Xatolik yuz berdi. Iltimos, qayta urinib ko'ring.")
             return
         
+        # Check if user is waiting for name input
+        state = self.state_manager.get_state(user_id)
+        if state.step == "waiting_for_name":
+            await update.message.reply_text("Ism Familiyangiz:", reply_markup=None)
+            return
+        
         # Check authentication first (regardless of status)
         if user.auth == 0:
             # Need authentication - this is required for all users
             logger.info(f"[START] User {user_id} needs authentication (auth=0)")
             print(f"[START] User {user_id} needs authentication (auth=0)")
-            state = self.state_manager.get_state(user_id)
             state.step = "waiting_for_phone"
+            # Create keyboard with contact button
+            keyboard = [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
             await update.message.reply_text(
                 "👋 Xush kelibsiz!\n\n"
-                "📱 Avval Telegram akkauntingizga kirish uchun telefon raqamingizni kiriting (masalan: +998901234567):"
+                "📱 Avval Telegram akkauntingizga kirish uchun telefon raqamingizni yuboring yoki kiriting (masalan: +998901234567):",
+                reply_markup=reply_markup
             )
             return
         
@@ -448,6 +460,12 @@ class MessengerBot:
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         
+        # Check if user is waiting for name input
+        state = self.state_manager.get_state(user_id)
+        if state.step == "waiting_for_name":
+            await update.message.reply_text("Ism Familiyangiz:", reply_markup=None)
+            return
+        
         # Check if user is active
         user = self.user_storage.get_user(user_id)
         if user and user.status == 0:
@@ -460,6 +478,67 @@ class MessengerBot:
         # For all users, show contact message
         await update.message.reply_text("admin bilan bog'lanish: @system24admin")
     
+    async def handle_contact(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle contact (phone number) sharing."""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+        
+        state = self.state_manager.get_state(user_id)
+        
+        # Only process contact if we're waiting for phone
+        if state.step != "waiting_for_phone":
+            return
+        
+        contact = update.message.contact
+        if not contact or not contact.phone_number:
+            await update.message.reply_text(
+                "❌ Telefon raqam olinmadi. Iltimos, qayta urinib ko'ring."
+            )
+            return
+        
+        # Get phone number from contact
+        phone = contact.phone_number
+        
+        # Ensure phone starts with + (Telegram usually provides it)
+        if not phone.startswith('+'):
+            phone = '+' + phone
+        
+        # Validate phone number format: +998 followed by 9 digits (total 12 digits after +998)
+        if not phone.startswith('+998'):
+            await update.message.reply_text(
+                "❌ Telefon raqam noto'g'ri formatda.\n\n"
+                "Iltimos, +998 bilan boshlanadigan 12 xonali raqam kiriting (masalan: +998901234567):"
+            )
+            return
+        
+        # Remove +998 and check if remaining is 9 digits
+        remaining = phone[4:].replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+        if not remaining.isdigit() or len(remaining) != 9:
+            await update.message.reply_text(
+                "❌ Telefon raqam noto'g'ri formatda.\n\n"
+                "Iltimos, +998 bilan boshlanadigan 12 xonali raqam kiriting (masalan: +998901234567):"
+            )
+            return
+        
+        # Format phone number properly: +998 + 9 digits
+        formatted_phone = f"+998{remaining}"
+        state.phone = formatted_phone
+        # Save phone number to database
+        self.user_storage.update_user_phone(user_id, formatted_phone)
+        # Send code request to user's phone
+        code_sent = await self._send_code_request(user_id, formatted_phone)
+        if code_sent:
+            state.step = "waiting_for_code"
+            # Remove keyboard
+            await update.message.reply_text(
+                f"📝 Telegram akkauntingizga kod yuborildi.\n\n"
+                f"Kodni kiriting (masalan: {' '.join(['X'] * 5)}):\n"
+                f"⚠️ Eslatma: Kodni bo'shliqlar bilan yoki bo'shliqlarsiz kiritishingiz mumkin.",
+                reply_markup=None
+            )
+        else:
+            await update.message.reply_text("❌ Kod yuborishda xatolik yuz berdi. Qayta urinib ko'ring.")
+    
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text messages."""
         user_id = update.effective_user.id
@@ -470,20 +549,39 @@ class MessengerBot:
         
         # Handle authentication flow
         if state.step == "waiting_for_phone":
-            state.phone = text
+            # Validate phone number format: +998 followed by 9 digits (total 12 digits after +998)
+            phone = text.strip()
+            if not phone.startswith('+998'):
+                await update.message.reply_text(
+                    "❌ Telefon raqam noto'g'ri formatda.\n\n"
+                    "Iltimos, +998 bilan boshlanadigan 12 xonali raqam kiriting (masalan: +998901234567):"
+                )
+                return
+            
+            # Remove +998 and check if remaining is 9 digits
+            remaining = phone[4:].replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
+            if not remaining.isdigit() or len(remaining) != 9:
+                await update.message.reply_text(
+                    "❌ Telefon raqam noto'g'ri formatda.\n\n"
+                    "Iltimos, +998 bilan boshlanadigan 12 xonali raqam kiriting (masalan: +998901234567):"
+                )
+                return
+            
+            # Format phone number properly: +998 + 9 digits
+            formatted_phone = f"+998{remaining}"
+            state.phone = formatted_phone
             # Save phone number to database
-            self.user_storage.update_user_phone(user_id, text)
+            self.user_storage.update_user_phone(user_id, formatted_phone)
             # Send code request to user's phone
-            code_sent = await self._send_code_request(user_id, text)
+            code_sent = await self._send_code_request(user_id, formatted_phone)
             if code_sent:
                 state.step = "waiting_for_code"
-                # Get code length from state (if available) or use default
-                code_length = 5  # Default Telegram code length
-                code_format = " ".join(["X"] * code_length)
+                # Remove keyboard
                 await update.message.reply_text(
                     f"📝 Telegram akkauntingizga kod yuborildi.\n\n"
-                    f"Kodni kiriting (masalan: {code_format}):\n"
-                    f"⚠️ Eslatma: Kodni bo'shliqlar bilan yoki bo'shliqlarsiz kiritishingiz mumkin."
+                    f"Kodni kiriting (masalan: {' '.join(['X'] * 5)}):\n"
+                    f"⚠️ Eslatma: Kodni bo'shliqlar bilan yoki bo'shliqlarsiz kiritishingiz mumkin.",
+                    reply_markup=None
                 )
             else:
                 await update.message.reply_text("❌ Kod yuborishda xatolik yuz berdi. Qayta urinib ko'ring.")
@@ -512,7 +610,7 @@ class MessengerBot:
                 if user and not user.full_name:
                     # New user - ask for full name
                     state.step = "waiting_for_name"
-                    await update.message.reply_text("Ism Familiyangiz:")
+                    await update.message.reply_text("Ism Familiyangiz:", reply_markup=None)
                     return
                 
                 state.step = ""
@@ -530,8 +628,12 @@ class MessengerBot:
                     )
             elif result == "code_expired":
                 # Code expired, ask to resend
+                # Create keyboard with contact button
+                keyboard = [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]]
+                reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
                 await update.message.reply_text(
-                    "⏰ Kod eskirib qolgan. Yangi kod yuborish uchun telefon raqamingizni qayta kiriting:"
+                    "⏰ Kod eskirib qolgan. Yangi kod yuborish uchun telefon raqamingizni qayta yuboring yoki kiriting:",
+                    reply_markup=reply_markup
                 )
                 state.step = "waiting_for_phone"
                 state.phone_code_hash = None
@@ -569,7 +671,7 @@ class MessengerBot:
                 if user and not user.full_name:
                     # New user - ask for full name
                     state.step = "waiting_for_name"
-                    await update.message.reply_text("Ism Familiyangiz:")
+                    await update.message.reply_text("Ism Familiyangiz:", reply_markup=None)
                     return
                 
                 state.step = ""
@@ -593,26 +695,38 @@ class MessengerBot:
         
         # Handle full name input
         if state.step == "waiting_for_name":
+            # Check if user sent a command - ignore it and ask again
+            if text.startswith('/'):
+                await update.message.reply_text("Ism Familiyangiz:", reply_markup=None)
+                return
+            
             full_name = text.strip()
-            if full_name:
-                # Save full name to database
-                self.user_storage.update_user_full_name(user_id, full_name)
-                state.step = ""
-                
-                # Check if user is activated
-                user = self.user_storage.get_user(user_id)
-                if user and user.status == 1:
-                    # User is activated, show main menu
-                    await update.message.reply_text("✅ Autentifikatsiya muvaffaqiyatli!")
-                    await self._show_main_menu(chat_id)
-                else:
-                    # User authenticated but not activated by admin (default status=0 for new users)
-                    await update.message.reply_text(
-                        "✅ Akkaunt ochildi siz uchun.\n\n"
-                        "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
-                    )
+            # Validate that it's a proper name (not empty, has at least 2 characters, not just numbers/symbols)
+            if not full_name or len(full_name) < 2:
+                await update.message.reply_text("❌ Ism bo'sh bo'lishi yoki juda qisqa bo'lishi mumkin emas. Iltimos, to'liq ism familiyangizni kiriting:")
+                return
+            
+            # Check if it's mostly letters (allow spaces and some special characters)
+            if not any(c.isalpha() for c in full_name):
+                await update.message.reply_text("❌ Iltimos, to'g'ri ism familiyangizni kiriting (faqat raqamlar yoki belgilar emas):")
+                return
+            
+            # Save full name to database
+            self.user_storage.update_user_full_name(user_id, full_name)
+            state.step = ""
+            
+            # Check if user is activated
+            user = self.user_storage.get_user(user_id)
+            if user and user.status == 1:
+                # User is activated, show main menu
+                await update.message.reply_text("✅ Autentifikatsiya muvaffaqiyatli!")
+                await self._show_main_menu(chat_id)
             else:
-                await update.message.reply_text("❌ Ism bo'sh bo'lishi mumkin emas. Iltimos, ismingizni kiriting:")
+                # User authenticated but not activated by admin (default status=0 for new users)
+                await update.message.reply_text(
+                    "✅ Akkaunt ochildi siz uchun.\n\n"
+                    "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
+                )
             return
         
         # Handle pending message
@@ -629,9 +743,13 @@ class MessengerBot:
                 # Not authenticated, show auth prompt
                 state = self.state_manager.get_state(user_id)
                 state.step = "waiting_for_phone"
+                # Create keyboard with contact button
+                keyboard = [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]]
+                reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
                 await update.message.reply_text(
                     "👋 Xush kelibsiz!\n\n"
-                    "📱 Avval Telegram akkauntingizga kirish uchun telefon raqamingizni kiriting (masalan: +998901234567):"
+                    "📱 Avval Telegram akkauntingizga kirish uchun telefon raqamingizni yuboring yoki kiriting (masalan: +998901234567):",
+                    reply_markup=reply_markup
                 )
                 return
             elif user.status == 0:
@@ -700,15 +818,7 @@ class MessengerBot:
             if not state.selected_groups:
                 await query.message.reply_text("⚠️ Hech qanday guruh tanlanmadi!")
                 return
-            # After groups are selected, show duration options first (Qancha vaqt davomida)
-            await self._show_duration_options(chat_id, user_id)
-            return
-        
-        # Duration option selection
-        if data.startswith("select_duration_"):
-            duration_id = int(data.split("_")[2])
-            state.selected_duration_id = duration_id
-            # After duration is selected, show schedule intervals (Qancha vaqtda bir marta)
+            # After groups are selected, show schedule intervals first (Qancha vaqtda bir marta)
             await self._show_schedule_intervals(chat_id, user_id)
             return
         
@@ -716,7 +826,15 @@ class MessengerBot:
         if data.startswith("select_interval_"):
             interval_id = int(data.split("_")[2])
             state.selected_interval_id = interval_id
-            # After interval is selected, save the scheduled message
+            # After interval is selected, show duration options (Qancha vaqt davomida)
+            await self._show_duration_options(chat_id, user_id)
+            return
+        
+        # Duration option selection
+        if data.startswith("select_duration_"):
+            duration_id = int(data.split("_")[2])
+            state.selected_duration_id = duration_id
+            # After duration is selected, save the scheduled message
             await self._save_scheduled_message(chat_id, user_id)
             return
         
