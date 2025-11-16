@@ -237,6 +237,9 @@ class MessengerBot:
         self.application.add_handler(CallbackQueryHandler(self.handle_callback))
         # Handle contact messages (phone number sharing)
         self.application.add_handler(MessageHandler(filters.CONTACT, self.handle_contact))
+        # Handle video messages (for getting file_id)
+        self.application.add_handler(MessageHandler(filters.VIDEO, self.handle_video_message))
+        self.application.add_handler(MessageHandler(filters.Document.VIDEO, self.handle_video_document))
         # Handle text messages (but not commands)
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
         # Handle user leaving/blocking the bot
@@ -538,6 +541,160 @@ class MessengerBot:
             )
         else:
             await update.message.reply_text("❌ Kod yuborishda xatolik yuz berdi. Qayta urinib ko'ring.")
+    
+    def _update_env_file(self, file_id: str) -> bool:
+        """Update .env file with new VIDEO_TUTORIAL_FILE_ID."""
+        try:
+            from pathlib import Path
+            import re
+            
+            # Get project root directory
+            project_root = Path(__file__).resolve().parent.parent
+            env_file = project_root / ".env"
+            
+            if not env_file.exists():
+                logger.warning(f".env file not found at {env_file}")
+                return False
+            
+            # Read .env file
+            with open(env_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Update or add VIDEO_TUTORIAL_FILE_ID
+            pattern = r'^VIDEO_TUTORIAL_FILE_ID=.*$'
+            replacement = f'VIDEO_TUTORIAL_FILE_ID={file_id}'
+            
+            if re.search(pattern, content, re.MULTILINE):
+                # Update existing line
+                content = re.sub(pattern, replacement, content, flags=re.MULTILINE)
+            else:
+                # Add new line
+                content += f'\n{replacement}\n'
+            
+            # Write back to .env file
+            with open(env_file, 'w', encoding='utf-8') as f:
+                f.write(content)
+            
+            # Reload config
+            from dotenv import load_dotenv
+            load_dotenv(override=True)
+            self.config.VIDEO_TUTORIAL_FILE_ID = file_id
+            
+            logger.info(f"✅ Updated .env file with new VIDEO_TUTORIAL_FILE_ID: {file_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error updating .env file: {e}", exc_info=True)
+            return False
+    
+    async def handle_video_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle video messages to get file_id."""
+        user_id = update.effective_user.id
+        video = update.message.video
+        
+        if video:
+            file_id = video.file_id
+            file_unique_id = video.file_unique_id
+            
+            # Get video info
+            file_size = video.file_size
+            duration = video.duration
+            width = video.width
+            height = video.height
+            
+            # Update .env file automatically
+            env_updated = self._update_env_file(file_id)
+            
+            if env_updated:
+                message = (
+                    f"✅ Video qabul qilindi va .env fayli yangilandi!\n\n"
+                    f"📹 File ID:\n<code>{file_id}</code>\n\n"
+                    f"🆔 File Unique ID: {file_unique_id}\n"
+                    f"📊 O'lcham: {width}x{height}\n"
+                    f"⏱️ Davomiyligi: {duration} soniya\n"
+                    f"💾 Hajmi: {file_size} bytes\n\n"
+                    f"✅ .env fayli avtomatik yangilandi!\n"
+                    f"Endi 'Video qo'llanma' tugmasi ishlaydi."
+                )
+            else:
+                message = (
+                    f"✅ Video qabul qilindi!\n\n"
+                    f"📹 File ID:\n<code>{file_id}</code>\n\n"
+                    f"🆔 File Unique ID: {file_unique_id}\n"
+                    f"📊 O'lcham: {width}x{height}\n"
+                    f"⏱️ Davomiyligi: {duration} soniya\n"
+                    f"💾 Hajmi: {file_size} bytes\n\n"
+                    f"⚠️ .env faylini avtomatik yangilab bo'lmadi.\n"
+                    f"Quyidagi file_id ni .env fayliga qo'shing:\n"
+                    f"<code>VIDEO_TUTORIAL_FILE_ID={file_id}</code>"
+                )
+            
+            await update.message.reply_text(message, parse_mode='HTML')
+            
+            # Also print to console
+            print("\n" + "=" * 60)
+            print("VIDEO FILE_ID TOPILDI!")
+            print("=" * 60)
+            print(f"File ID: {file_id}")
+            print(f"File Unique ID: {file_unique_id}")
+            if env_updated:
+                print("✅ .env fayli avtomatik yangilandi!")
+            else:
+                print(f"\n.env fayliga quyidagini qo'shing:")
+                print(f"VIDEO_TUTORIAL_FILE_ID={file_id}")
+            print("=" * 60 + "\n")
+            
+            logger.info(f"Video file_id received: {file_id}")
+    
+    async def handle_video_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle video documents to get file_id."""
+        user_id = update.effective_user.id
+        document = update.message.document
+        
+        if document and document.mime_type and 'video' in document.mime_type:
+            file_id = document.file_id
+            file_unique_id = document.file_unique_id
+            
+            # Update .env file automatically
+            env_updated = self._update_env_file(file_id)
+            
+            if env_updated:
+                message = (
+                    f"✅ Video fayl (document sifatida) qabul qilindi va .env fayli yangilandi!\n\n"
+                    f"📹 File ID:\n<code>{file_id}</code>\n\n"
+                    f"🆔 File Unique ID: {file_unique_id}\n"
+                    f"📄 Fayl nomi: {document.file_name or 'Noma\'lum'}\n"
+                    f"💾 Hajmi: {document.file_size} bytes\n\n"
+                    f"✅ .env fayli avtomatik yangilandi!\n"
+                    f"Endi 'Video qo'llanma' tugmasi ishlaydi."
+                )
+            else:
+                message = (
+                    f"✅ Video fayl (document sifatida) qabul qilindi!\n\n"
+                    f"📹 File ID:\n<code>{file_id}</code>\n\n"
+                    f"🆔 File Unique ID: {file_unique_id}\n"
+                    f"📄 Fayl nomi: {document.file_name or 'Noma\'lum'}\n"
+                    f"💾 Hajmi: {document.file_size} bytes\n\n"
+                    f"⚠️ .env faylini avtomatik yangilab bo'lmadi.\n"
+                    f"Quyidagi file_id ni .env fayliga qo'shing:\n"
+                    f"<code>VIDEO_TUTORIAL_FILE_ID={file_id}</code>"
+                )
+            
+            await update.message.reply_text(message, parse_mode='HTML')
+            
+            # Also print to console
+            print("\n" + "=" * 60)
+            print("VIDEO FILE_ID TOPILDI (document sifatida)!")
+            print("=" * 60)
+            print(f"File ID: {file_id}")
+            print(f"File Unique ID: {file_unique_id}")
+            if env_updated:
+                print("✅ .env fayli avtomatik yangilandi!")
+            else:
+                print(f"\n.env fayliga quyidagini qo'shing:")
+                print(f"VIDEO_TUTORIAL_FILE_ID={file_id}")
+            print("=" * 60 + "\n")
+            
+            logger.info(f"Video file_id received (as document): {file_id}")
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle text messages."""
@@ -947,34 +1104,94 @@ class MessengerBot:
     
     async def _send_video_tutorial(self, chat_id: int):
         """Send video tutorial."""
-        caption = "Video qo'llanma\nadmin: @FayzulloKomilov"
+        caption = "Video qo'llanma\nadmin: @system24admin"
         
         try:
             # Try sending by file_id first
             if self.config.VIDEO_TUTORIAL_FILE_ID:
-                await self.application.bot.send_video(
-                    chat_id,
-                    video=self.config.VIDEO_TUTORIAL_FILE_ID,
-                    caption=caption
-                )
-            # Fallback to file path
-            elif self.config.VIDEO_TUTORIAL_PATH:
-                with open(self.config.VIDEO_TUTORIAL_PATH, 'rb') as video:
+                try:
                     await self.application.bot.send_video(
                         chat_id,
-                        video=video,
+                        video=self.config.VIDEO_TUTORIAL_FILE_ID.strip(),
                         caption=caption
                     )
+                    # Show main menu after sending video
+                    await self._show_main_menu(chat_id)
+                    return
+                except Exception as file_id_error:
+                    file_id_used = self.config.VIDEO_TUTORIAL_FILE_ID.strip()
+                    logger.warning(f"Failed to send video by file_id: {file_id_error}")
+                    logger.warning(f"File_id used: {file_id_used[:50]}... (length: {len(file_id_used)})")
+                    logger.info("Trying to send video by file path as fallback...")
+                    # If file_id fails, try file path
+                    if self.config.VIDEO_TUTORIAL_PATH:
+                        try:
+                            with open(self.config.VIDEO_TUTORIAL_PATH, 'rb') as video:
+                                await self.application.bot.send_video(
+                                    chat_id,
+                                    video=video,
+                                    caption=caption
+                                )
+                                # Show main menu after sending video
+                                await self._show_main_menu(chat_id)
+                                return
+                        except Exception as file_path_error:
+                            logger.error(f"Failed to send video by file path: {file_path_error}")
+                            await self.application.bot.send_message(
+                                chat_id,
+                                "⚠️ Videoni yuborishda xatolik yuz berdi.\n\n"
+                                "Iltimos, video faylini botga yuboring va uning file_id sini oling."
+                            )
+                            return
+                    else:
+                        file_id_used = self.config.VIDEO_TUTORIAL_FILE_ID.strip()
+                        await self.application.bot.send_message(
+                            chat_id,
+                            "⚠️ Video file_id noto'g'ri yoki eskirgan.\n\n"
+                            "📹 To'g'ri file_id olish uchun:\n"
+                            "1. Video faylini shu botga yuboring\n"
+                            "2. Bot avtomatik ravishda file_id ni .env fayliga yozadi\n"
+                            "3. Botni qayta ishga tushiring\n\n"
+                            f"🔍 Hozirgi file_id: <code>{file_id_used[:30]}...</code>\n"
+                            "❌ Bu file_id ishlamayapti.",
+                            parse_mode='HTML'
+                        )
+                        return
+            # Fallback to file path
+            elif self.config.VIDEO_TUTORIAL_PATH:
+                try:
+                    with open(self.config.VIDEO_TUTORIAL_PATH, 'rb') as video:
+                        await self.application.bot.send_video(
+                            chat_id,
+                            video=video,
+                            caption=caption
+                        )
+                        # Show main menu after sending video
+                        await self._show_main_menu(chat_id)
+                        return
+                except Exception as file_path_error:
+                    logger.error(f"Failed to send video by file path: {file_path_error}")
+                    await self.application.bot.send_message(
+                        chat_id,
+                        "⚠️ Video faylini topib bo'lmadi.\n\n"
+                        "Iltimos, video faylini botga yuboring va uning file_id sini oling."
+                    )
+                    return
             else:
-                await self.application.bot.send_message(chat_id, "⚠️ Video topilmadi.")
+                await self.application.bot.send_message(
+                    chat_id,
+                    "⚠️ Video topilmadi.\n\n"
+                    "Iltimos, video faylini botga yuboring va uning file_id sini oling."
+                )
                 return
         except Exception as e:
-            logger.error(f"Video qo'llanmani yuborishda xato: {e}")
-            await self.application.bot.send_message(chat_id, "⚠️ Videoni yuborishda xatolik yuz berdi.")
+            logger.error(f"Video qo'llanmani yuborishda xato: {e}", exc_info=True)
+            await self.application.bot.send_message(
+                chat_id,
+                "⚠️ Videoni yuborishda xatolik yuz berdi.\n\n"
+                "Iltimos, video faylini botga yuboring va uning file_id sini oling."
+            )
             return
-        
-        # Show main menu after sending video
-        await self._show_main_menu(chat_id)
     
     async def _show_messages_table(self, chat_id: int, user_id: int):
         """Show scheduled messages table for the user."""
