@@ -860,8 +860,9 @@ class MessengerBot:
         )
     
     async def _show_schedule_intervals(self, chat_id: int, user_id: int):
-        """Show schedule interval options."""
+        """Show schedule interval options (minutes - from schedule_intervals table)."""
         try:
+            # Use schedule_intervals for minutes (1 daqiqa, 2 daqiqa, etc.)
             intervals = self.scheduled_storage.get_schedule_intervals()
             
             if not intervals:
@@ -871,7 +872,7 @@ class MessengerBot:
                 )
                 return
             
-            text = "⏰ Qancha vaqtda bir marta yuborilsin?\n\nQuyidagilardan birini tanlang:"
+            text = "⏰ Qancha vaqtda bir martadan yuborib turilsin?\n\nQuyidagilardan birini tanlang:"
             keyboard = []
             
             # Group intervals into rows of 3
@@ -902,8 +903,9 @@ class MessengerBot:
             )
     
     async def _show_duration_options(self, chat_id: int, user_id: int):
-        """Show duration options."""
+        """Show duration options (hours - from duration_options table)."""
         try:
+            # Use duration_options for hours (1 soat, 2 soat, etc.)
             durations = self.scheduled_storage.get_duration_options()
             
             if not durations:
@@ -913,7 +915,7 @@ class MessengerBot:
                 )
                 return
             
-            text = "⏰ Qancha vaqt davomida yuborilsin?\n\nQuyidagilardan birini tanlang:"
+            text = "⏰ Qancha vaqt davomida yuborib turilsin?\n\nQuyidagilardan birini tanlang:"
             keyboard = []
             
             # Group durations into rows of 3
@@ -977,7 +979,7 @@ class MessengerBot:
     async def _show_messages_table(self, chat_id: int, user_id: int):
         """Show scheduled messages table for the user."""
         try:
-            # Query scheduled messages for this user
+            # Query scheduled messages for this user with group names
             query = """
                 SELECT 
                     sm.id,
@@ -986,7 +988,8 @@ class MessengerBot:
                     sm.paused,
                     sm.expires_at,
                     sm.created_at,
-                    COUNT(smg.group_id) as group_count
+                    COUNT(smg.group_id) as group_count,
+                    ARRAY_AGG(smg.group_id) as group_ids
                 FROM scheduled_messages sm
                 LEFT JOIN scheduled_message_groups smg ON sm.id = smg.scheduled_id
                 WHERE sm.user_id = %s
@@ -1011,6 +1014,9 @@ class MessengerBot:
             # Format messages for display
             text = "📋 Rejalashtirilgan xabarlar:\n\n"
             
+            # Get client for fetching group names
+            client = await self._get_or_create_client(user_id)
+            
             for idx, msg in enumerate(messages, 1):
                 message_id = msg['id']
                 message_text = msg['message']
@@ -1019,6 +1025,33 @@ class MessengerBot:
                 expires_at = msg['expires_at']
                 created_at = msg['created_at']
                 group_count = msg['group_count'] or 0
+                group_ids = msg.get('group_ids') or []
+                
+                # Filter out None values from group_ids array
+                if group_ids and group_ids[0] is None:
+                    group_ids = []
+                
+                # Get group names
+                group_names = []
+                if group_ids:
+                    for group_id in group_ids[:5]:  # Limit to 5 groups to avoid long text
+                        try:
+                            group_name = await get_group_name(client, group_id)
+                            group_names.append(group_name)
+                        except Exception as e:
+                            logger.warning(f"Error getting group name for {group_id}: {e}")
+                            group_names.append(f"Guruh {group_id}")
+                
+                # Format group display
+                if group_names:
+                    if len(group_names) == 1:
+                        groups_display = group_names[0]
+                    elif len(group_names) <= 3:
+                        groups_display = ", ".join(group_names)
+                    else:
+                        groups_display = ", ".join(group_names[:3]) + f" va yana {len(group_names) - 3} ta"
+                else:
+                    groups_display = f"{group_count} ta"
                 
                 # Truncate message if too long
                 if len(message_text) > 50:
@@ -1046,6 +1079,19 @@ class MessengerBot:
                 else:
                     created_str = "Noma'lum"
                 
+                # Calculate correct expires_at based on interval if it seems wrong
+                # If expires_at is too close to created_at, recalculate based on interval
+                if expires_at and created_at:
+                    time_diff = (expires_at - created_at).total_seconds() / 3600  # hours
+                    interval_hours = interval / 60  # convert minutes to hours
+                    # If the difference is less than interval, it's likely wrong
+                    # Recalculate: expires_at should be at least created_at + interval
+                    if time_diff < interval_hours:
+                        # Recalculate based on duration (which should be >= interval)
+                        # For now, use interval as minimum duration
+                        from datetime import timedelta
+                        expires_at = created_at + timedelta(hours=interval_hours)
+                
                 if expires_at:
                     expires_str = expires_at.strftime("%Y-%m-%d %H:%M")
                 else:
@@ -1055,7 +1101,7 @@ class MessengerBot:
                 text += f"💬 {display_message}\n"
                 text += f"⏱️ Interval: {interval_text}\n"
                 text += f"📊 Status: {status}\n"
-                text += f"👥 Guruhlar: {group_count} ta\n"
+                text += f"👥 Guruhlar: {groups_display}\n"
                 text += f"📅 Yaratilgan: {created_str}\n"
                 text += f"⏰ Tugaydi: {expires_str}\n"
                 text += "\n" + "─" * 30 + "\n\n"
@@ -1511,23 +1557,32 @@ class MessengerBot:
                 return
             
             # Get interval and duration details
-            intervals = self.scheduled_storage.get_schedule_intervals()
-            durations = self.scheduled_storage.get_duration_options()
+            # Note: selected_interval_id comes from schedule_intervals (minutes)
+            #       selected_duration_id comes from duration_options (hours)
+            schedule_intervals = self.scheduled_storage.get_schedule_intervals()  # minutes
+            duration_options = self.scheduled_storage.get_duration_options()  # hours
             
-            selected_interval = next((i for i in intervals if i['id'] == state.selected_interval_id), None)
-            selected_duration = next((d for d in durations if d['id'] == state.selected_duration_id), None)
+            selected_interval = next((i for i in schedule_intervals if i['id'] == state.selected_interval_id), None)
+            selected_duration = next((d for d in duration_options if d['id'] == state.selected_duration_id), None)
             
             if not selected_interval or not selected_duration:
                 await self.application.bot.send_message(chat_id, "⚠️ Interval yoki duration topilmadi!")
                 return
             
-            # Calculate interval_minutes
+            # Calculate interval_minutes from schedule_intervals (which has minutes)
             interval_minutes = int(selected_interval['minutes'])
+            interval_hours = interval_minutes / 60.0  # Convert to hours for comparison
             
-            # Calculate expires_at based on duration
+            # Calculate expires_at based on duration from duration_options (which has hours)
             from datetime import datetime, timedelta
             now = datetime.now(TASHKENT_TZ)
-            duration_hours = selected_duration['hours']
+            duration_hours = float(selected_duration['hours'])
+            
+            # Ensure duration is at least equal to interval (in hours)
+            # If duration is less than interval, use interval as minimum
+            if duration_hours < interval_hours:
+                duration_hours = interval_hours
+            
             expires_at = now + timedelta(hours=duration_hours)
             
             # Insert scheduled message
