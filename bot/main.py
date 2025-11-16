@@ -860,10 +860,10 @@ class MessengerBot:
         )
     
     async def _show_schedule_intervals(self, chat_id: int, user_id: int):
-        """Show schedule interval options (minutes - from schedule_intervals table)."""
+        """Show schedule interval options (minutes - from duration_options table)."""
         try:
-            # Use schedule_intervals for minutes (1 daqiqa, 2 daqiqa, etc.)
-            intervals = self.scheduled_storage.get_schedule_intervals()
+            # Use duration_options for minutes (1 daqiqa, 2 daqiqa, etc.)
+            intervals = self.scheduled_storage.get_duration_options()
             
             if not intervals:
                 await self.application.bot.send_message(
@@ -903,10 +903,10 @@ class MessengerBot:
             )
     
     async def _show_duration_options(self, chat_id: int, user_id: int):
-        """Show duration options (hours - from duration_options table)."""
+        """Show duration options (hours - from schedule_intervals table)."""
         try:
-            # Use duration_options for hours (1 soat, 2 soat, etc.)
-            durations = self.scheduled_storage.get_duration_options()
+            # Use schedule_intervals for hours (1 soat, 2 soat, etc.)
+            durations = self.scheduled_storage.get_schedule_intervals()
             
             if not durations:
                 await self.application.bot.send_message(
@@ -1073,16 +1073,32 @@ class MessengerBot:
                     else:
                         interval_text = f"{hours} soat"
                 
-                # Format dates
+                # Format dates - convert to Tashkent timezone
                 if created_at:
-                    created_str = created_at.strftime("%Y-%m-%d %H:%M")
+                    # Ensure timezone is set to Tashkent
+                    if created_at.tzinfo is None:
+                        created_at_tz = created_at.replace(tzinfo=TASHKENT_TZ)
+                    else:
+                        created_at_tz = created_at.astimezone(TASHKENT_TZ)
+                    created_str = created_at_tz.strftime("%Y-%m-%d %H:%M")
                 else:
                     created_str = "Noma'lum"
                 
                 # Calculate correct expires_at based on interval if it seems wrong
                 # If expires_at is too close to created_at, recalculate based on interval
                 if expires_at and created_at:
-                    time_diff = (expires_at - created_at).total_seconds() / 3600  # hours
+                    # Ensure both are in Tashkent timezone
+                    if expires_at.tzinfo is None:
+                        expires_at_tz = expires_at.replace(tzinfo=TASHKENT_TZ)
+                    else:
+                        expires_at_tz = expires_at.astimezone(TASHKENT_TZ)
+                    
+                    if created_at.tzinfo is None:
+                        created_at_tz = created_at.replace(tzinfo=TASHKENT_TZ)
+                    else:
+                        created_at_tz = created_at.astimezone(TASHKENT_TZ)
+                    
+                    time_diff = (expires_at_tz - created_at_tz).total_seconds() / 3600  # hours
                     interval_hours = interval / 60  # convert minutes to hours
                     # If the difference is less than interval, it's likely wrong
                     # Recalculate: expires_at should be at least created_at + interval
@@ -1090,10 +1106,16 @@ class MessengerBot:
                         # Recalculate based on duration (which should be >= interval)
                         # For now, use interval as minimum duration
                         from datetime import timedelta
-                        expires_at = created_at + timedelta(hours=interval_hours)
-                
-                if expires_at:
-                    expires_str = expires_at.strftime("%Y-%m-%d %H:%M")
+                        expires_at_tz = created_at_tz + timedelta(hours=interval_hours)
+                    
+                    expires_str = expires_at_tz.strftime("%Y-%m-%d %H:%M")
+                elif expires_at:
+                    # Just convert to Tashkent timezone
+                    if expires_at.tzinfo is None:
+                        expires_at_tz = expires_at.replace(tzinfo=TASHKENT_TZ)
+                    else:
+                        expires_at_tz = expires_at.astimezone(TASHKENT_TZ)
+                    expires_str = expires_at_tz.strftime("%Y-%m-%d %H:%M")
                 else:
                     expires_str = "Cheklanmagan"
                 
@@ -1557,25 +1579,23 @@ class MessengerBot:
                 return
             
             # Get interval and duration details
-            # Note: selected_interval_id comes from schedule_intervals (minutes)
-            #       selected_duration_id comes from duration_options (hours)
-            schedule_intervals = self.scheduled_storage.get_schedule_intervals()  # minutes
-            duration_options = self.scheduled_storage.get_duration_options()  # hours
+            # Note: selected_interval_id comes from duration_options (minutes)
+            #       selected_duration_id comes from schedule_intervals (hours)
+            duration_options = self.scheduled_storage.get_duration_options()  # has hours, but we need minutes
+            schedule_intervals = self.scheduled_storage.get_schedule_intervals()  # has minutes, but we need hours
             
-            selected_interval = next((i for i in schedule_intervals if i['id'] == state.selected_interval_id), None)
-            selected_duration = next((d for d in duration_options if d['id'] == state.selected_duration_id), None)
+            selected_interval = next((d for d in duration_options if d['id'] == state.selected_interval_id), None)
+            selected_duration = next((i for i in schedule_intervals if i['id'] == state.selected_duration_id), None)
             
             if not selected_interval or not selected_duration:
                 await self.application.bot.send_message(chat_id, "⚠️ Interval yoki duration topilmadi!")
                 return
             
-            # Calculate interval_minutes from schedule_intervals (which has minutes)
+            # Calculate interval_minutes from duration_options (which now has minutes)
             interval_minutes = int(selected_interval['minutes'])
             interval_hours = interval_minutes / 60.0  # Convert to hours for comparison
             
-            # Calculate expires_at based on duration from duration_options (which has hours)
-            from datetime import datetime, timedelta
-            now = datetime.now(TASHKENT_TZ)
+            # Calculate expires_at based on duration from schedule_intervals (which now has hours)
             duration_hours = float(selected_duration['hours'])
             
             # Ensure duration is at least equal to interval (in hours)
@@ -1583,6 +1603,9 @@ class MessengerBot:
             if duration_hours < interval_hours:
                 duration_hours = interval_hours
             
+            # Calculate expires_at with Tashkent timezone
+            from datetime import datetime, timedelta
+            now = datetime.now(TASHKENT_TZ)
             expires_at = now + timedelta(hours=duration_hours)
             
             # Insert scheduled message
