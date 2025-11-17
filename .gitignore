@@ -24,7 +24,7 @@ wheels/
 venv/
 ENV/
 env/
-
+staticfiles/
 # Environment variables
 .env
 .env.local
