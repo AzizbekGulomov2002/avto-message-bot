@@ -246,15 +246,30 @@ class MessengerBot:
         self.application.add_handler(ChatMemberHandler(self.handle_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     
     async def _get_or_create_client(self, user_id: int) -> Optional[TelegramClient]:
-        """Get or create Telegram client for user."""
+        """Get or create Telegram client for user. Sessions are preserved and restored automatically."""
         with self.clients_lock:
             if user_id in self.clients:
-                return self.clients[user_id]
+                client = self.clients[user_id]
+                # Verify client is still valid
+                try:
+                    if not client.is_connected():
+                        await client.connect()
+                    # Quick check if session is valid
+                    try:
+                        await client.get_me()
+                        return client
+                    except (AuthKeyUnregisteredError, Exception):
+                        # Session might be expired, but keep it and try to reconnect
+                        logger.warning(f"[CLIENT] Session check failed for user {user_id}, but keeping session file")
+                        pass
+                except Exception as e:
+                    logger.warning(f"[CLIENT] Error checking client for user {user_id}: {e}")
+                return client
             
             # Validate APP_ID and APP_HASH before creating client
-            logger.info(f"Creating Telegram client for user {user_id}")
-            logger.info(f"APP_ID: {self.config.APP_ID}, APP_HASH: {'*' * (len(self.config.APP_HASH) - 4) + self.config.APP_HASH[-4:] if len(self.config.APP_HASH) > 4 else '****'}")
-            print(f"[CLIENT] Creating Telegram client for user {user_id}")
+            logger.info(f"[CLIENT] Creating/restoring Telegram client for user {user_id}")
+            logger.info(f"[CLIENT] APP_ID: {self.config.APP_ID}, APP_HASH: {'*' * (len(self.config.APP_HASH) - 4) + self.config.APP_HASH[-4:] if len(self.config.APP_HASH) > 4 else '****'}")
+            print(f"[CLIENT] Creating/restoring Telegram client for user {user_id}")
             print(f"[CLIENT] APP_ID: {self.config.APP_ID}")
             print(f"[CLIENT] APP_HASH: {'*' * (len(self.config.APP_HASH) - 4) + self.config.APP_HASH[-4:] if len(self.config.APP_HASH) > 4 else '****'}")
             
@@ -269,13 +284,22 @@ class MessengerBot:
                 print(f"[CLIENT] Created sessions directory: {sessions_dir}")
             
             # Create new client with session file in sessions directory
+            # Session file will be loaded if it exists, or created if it doesn't
             session_file = str(sessions_dir / f"tg_session_{user_id}.session")
-            logger.info(f"[CLIENT] Session file path: {session_file}")
-            print(f"[CLIENT] Session file path: {session_file}")
+            session_exists = os.path.exists(session_file)
+            logger.info(f"[CLIENT] Session file path: {session_file} (exists: {session_exists})")
+            print(f"[CLIENT] Session file path: {session_file} (exists: {session_exists})")
+            
             client = TelegramClient(session_file, self.config.APP_ID, self.config.APP_HASH)
             self.clients[user_id] = client
-            logger.info(f"[CLIENT] ✅ Telegram client created successfully for user {user_id}")
-            print(f"[CLIENT] ✅ Telegram client created successfully for user {user_id}")
+            
+            if session_exists:
+                logger.info(f"[CLIENT] ✅ Telegram client restored from existing session for user {user_id}")
+                print(f"[CLIENT] ✅ Telegram client restored from existing session for user {user_id}")
+            else:
+                logger.info(f"[CLIENT] ✅ Telegram client created successfully for user {user_id}")
+                print(f"[CLIENT] ✅ Telegram client created successfully for user {user_id}")
+            
             return client
     
     async def _send_code_request(self, user_id: int, phone: str) -> bool:
@@ -1669,25 +1693,56 @@ class MessengerBot:
             try:
                 groups = await fetch_user_groups(client, user_id)
             except AuthKeyUnregisteredError:
-                # Session expired - user needs to re-authenticate
+                # Session expired - try to reconnect and restore session
+                logger.warning(f"[GROUPS] Session expired for user {user_id}, attempting to restore...")
                 try:
                     await loading_msg.delete()
                 except:
                     pass
-                # Reset auth status and remove client
-                self.user_storage.set_user_auth(user_id, 0)
-                with self.clients_lock:
-                    if user_id in self.clients:
+                
+                # Try to restore session by reconnecting
+                try:
+                    with self.clients_lock:
+                        if user_id in self.clients:
+                            client = self.clients[user_id]
+                            try:
+                                if client.is_connected():
+                                    await client.disconnect()
+                            except:
+                                pass
+                            # Remove from memory but keep session files
+                            del self.clients[user_id]
+                    
+                    # Try to reconnect with existing session file
+                    client = await self._get_or_create_client(user_id)
+                    if client:
                         try:
-                            await self.clients[user_id].disconnect()
-                        except:
-                            pass
-                        del self.clients[user_id]
-                await self.application.bot.send_message(
-                    chat_id,
-                    "⚠️ Sizning session muddati tugagan. Iltimos, qayta autentifikatsiya qiling.\n\n/start buyrug'ini yuboring va telefon raqamingizni kiriting."
-                )
-                return
+                            await client.connect()
+                            # Verify session is still valid
+                            me = await client.get_me()
+                            if me:
+                                logger.info(f"[GROUPS] ✅ Session restored for user {user_id}")
+                                # Retry fetching groups
+                                groups = await fetch_user_groups(client, user_id)
+                                # Continue with group selection if successful
+                            else:
+                                raise AuthKeyUnregisteredError("Session invalid")
+                        except Exception as restore_error:
+                            logger.error(f"[GROUPS] Failed to restore session for user {user_id}: {restore_error}")
+                            # Session cannot be restored, but don't delete it
+                            # User can manually re-authenticate if needed
+                            await self.application.bot.send_message(
+                                chat_id,
+                                "⚠️ Session bilan muammo bor. Iltimos, qayta urinib ko'ring yoki /start buyrug'ini yuboring."
+                            )
+                            return
+                except Exception as e:
+                    logger.error(f"[GROUPS] Error during session restore for user {user_id}: {e}")
+                    await self.application.bot.send_message(
+                        chat_id,
+                        "⚠️ Session bilan muammo bor. Iltimos, qayta urinib ko'ring."
+                    )
+                    return
             
             if not groups:
                 try:
@@ -2145,8 +2200,30 @@ class MessengerBot:
                             logger.warning(f"[SCHEDULED] No client for user {user_id}")
                             continue
                         
-                        if not client.is_connected():
-                            await client.connect()
+                        # Try to connect and verify session
+                        try:
+                            if not client.is_connected():
+                                await client.connect()
+                            
+                            # Verify session is valid
+                            try:
+                                await client.get_me()
+                            except AuthKeyUnregisteredError:
+                                # Session expired, but don't delete it - just skip this send
+                                logger.warning(f"[SCHEDULED] Session expired for user {user_id}, skipping message {scheduled_id}")
+                                # Remove client from memory but keep session file
+                                with self.clients_lock:
+                                    if user_id in self.clients:
+                                        try:
+                                            if client.is_connected():
+                                                await client.disconnect()
+                                        except:
+                                            pass
+                                        del self.clients[user_id]
+                                continue
+                        except Exception as e:
+                            logger.error(f"[SCHEDULED] Error connecting client for user {user_id}: {e}")
+                            continue
                         
                         # Send message to all groups
                         success_count = 0
@@ -2158,6 +2235,20 @@ class MessengerBot:
                                 await client.send_message(group_id, message_text)
                                 success_count += 1
                                 logger.info(f"[SCHEDULED] Sent message {scheduled_id} to group {group_id}")
+                            except AuthKeyUnregisteredError:
+                                # Session expired during send, but keep session file
+                                failed_count += 1
+                                logger.warning(f"[SCHEDULED] Session expired for user {user_id} while sending to group {group_id}")
+                                # Remove client from memory but keep session file
+                                with self.clients_lock:
+                                    if user_id in self.clients:
+                                        try:
+                                            if client.is_connected():
+                                                await client.disconnect()
+                                        except:
+                                            pass
+                                        del self.clients[user_id]
+                                break  # Stop trying to send to other groups
                             except Exception as e:
                                 failed_count += 1
                                 logger.error(f"[SCHEDULED] Error sending to group {group_id}: {e}")
@@ -2202,10 +2293,23 @@ class MessengerBot:
             new_status = chat_member.new_chat_member.status
             
             # Check if user left or blocked the bot
+            # NOTE: We do NOT delete session here - sessions are only deleted when admin removes user from admin panel
+            # This ensures sessions persist even if user temporarily leaves/returns
             if new_status in ['left', 'kicked']:
-                logger.info(f"[CHAT MEMBER] User {user_id} left or blocked the bot. Deleting session.")
-                print(f"[CHAT MEMBER] User {user_id} left or blocked the bot. Deleting session.")
-                self._delete_user_session(user_id)
+                logger.info(f"[CHAT MEMBER] User {user_id} left or blocked the bot. Session will be preserved.")
+                print(f"[CHAT MEMBER] User {user_id} left or blocked the bot. Session will be preserved.")
+                # Just disconnect client from memory, but keep session files
+                with self.clients_lock:
+                    if user_id in self.clients:
+                        try:
+                            client = self.clients[user_id]
+                            if client.is_connected():
+                                await client.disconnect()
+                        except:
+                            pass
+                        # Remove from memory but keep session files on disk
+                        del self.clients[user_id]
+                        logger.info(f"[CHAT MEMBER] Client removed from memory for user {user_id}, but session files preserved")
         except Exception as e:
             logger.error(f"Error handling chat member update: {e}", exc_info=True)
     
