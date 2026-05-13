@@ -576,8 +576,7 @@ class MessengerBot:
         return (
             "📝 Telegram akkauntingizga yangi kod yuborildi.\n\n"
             f"Faqat oxirgi kelgan kodni kiriting (masalan: {formatted_code_hint}).\n"
-            "⚠️ Kodni boshqa joyga yubormang va eski kodni qayta ishlatmang.\n"
-            "⚠️ Kodni bo'shliqlar bilan yoki bo'shliqlarsiz kiritishingiz mumkin."
+            "Raqamlar orasini ochib kiriting"
         )
 
     async def _send_code_request(self, user_id: int, phone: str) -> bool:
