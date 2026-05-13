@@ -3,6 +3,8 @@ Django settings for config project.
 """
 import os
 from pathlib import Path
+from urllib.parse import urlparse
+
 from dotenv import load_dotenv
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -22,8 +24,10 @@ DEBUG = os.getenv('DJANGO_DEBUG', 'False').lower() in ('true', '1', 'yes')
 
 allowed_hosts = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1')
 ALLOWED_HOSTS = [host.strip() for host in allowed_hosts.split(',') if host.strip()]
-if not ALLOWED_HOSTS:
-    ALLOWED_HOSTS = ['*']
+
+site_domain = os.getenv('DJANGO_SITE_DOMAIN', '').strip()
+if site_domain and site_domain not in ALLOWED_HOSTS:
+    ALLOWED_HOSTS.append(site_domain)
 
 csrf_trusted_origins = os.getenv('DJANGO_CSRF_TRUSTED_ORIGINS', '')
 CSRF_TRUSTED_ORIGINS = [
@@ -31,6 +35,14 @@ CSRF_TRUSTED_ORIGINS = [
     for origin in csrf_trusted_origins.split(',')
     if origin.strip()
 ]
+
+for origin in CSRF_TRUSTED_ORIGINS:
+    hostname = urlparse(origin).hostname
+    if hostname and hostname not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(hostname)
+
+if not ALLOWED_HOSTS:
+    ALLOWED_HOSTS = ['*']
 
 if os.getenv('DJANGO_USE_PROXY', 'False').lower() in ('true', '1', 'yes'):
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
