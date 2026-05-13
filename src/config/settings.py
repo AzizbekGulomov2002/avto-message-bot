@@ -22,14 +22,24 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-change-this-in-prod
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DJANGO_DEBUG', 'False').lower() in ('true', '1', 'yes')
 
+DEFAULT_SITE_DOMAIN = 'message.system24.app'
+
 allowed_hosts = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1')
 ALLOWED_HOSTS = [host.strip() for host in allowed_hosts.split(',') if host.strip()]
 
-site_domain = os.getenv('DJANGO_SITE_DOMAIN', '').strip()
-if site_domain and site_domain not in ALLOWED_HOSTS:
-    ALLOWED_HOSTS.append(site_domain)
+for host in (
+    os.getenv('DJANGO_SITE_DOMAIN', DEFAULT_SITE_DOMAIN).strip(),
+    DEFAULT_SITE_DOMAIN,
+    'localhost',
+    '127.0.0.1',
+):
+    if host and host not in ALLOWED_HOSTS:
+        ALLOWED_HOSTS.append(host)
 
-csrf_trusted_origins = os.getenv('DJANGO_CSRF_TRUSTED_ORIGINS', '')
+csrf_trusted_origins = os.getenv(
+    'DJANGO_CSRF_TRUSTED_ORIGINS',
+    f'https://{DEFAULT_SITE_DOMAIN}',
+)
 CSRF_TRUSTED_ORIGINS = [
     origin.strip()
     for origin in csrf_trusted_origins.split(',')
@@ -44,7 +54,13 @@ for origin in CSRF_TRUSTED_ORIGINS:
 if not ALLOWED_HOSTS:
     ALLOWED_HOSTS = ['*']
 
-if os.getenv('DJANGO_USE_PROXY', 'False').lower() in ('true', '1', 'yes'):
+use_proxy = os.getenv('DJANGO_USE_PROXY')
+if use_proxy is None:
+    USE_PROXY = True
+else:
+    USE_PROXY = use_proxy.lower() in ('true', '1', 'yes')
+
+if USE_PROXY:
     SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
     USE_X_FORWARDED_HOST = True
 
