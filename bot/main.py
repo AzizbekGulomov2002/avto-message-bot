@@ -337,13 +337,18 @@ class MessengerBot:
         )
         reply_markup = self._build_access_calendar_keyboard(user.id, now.year, now.month)
 
+        sent_any = False
         for superuser_id in superusers:
+            if superuser_id == user_id:
+                continue
             try:
                 await self.application.bot.send_message(superuser_id, text, reply_markup=reply_markup)
+                sent_any = True
             except Exception as e:
                 logger.error(f"Failed to notify superuser {superuser_id} about user {user_id}: {e}")
 
-        self.activation_request_sent.add(user_id)
+        if sent_any:
+            self.activation_request_sent.add(user_id)
 
     async def _maybe_request_activation_review(self, user_id: int):
         """Notify superusers once the user finished authentication."""
