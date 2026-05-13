@@ -245,22 +245,14 @@ class UserStorage:
     
     def get_superuser_ids(self) -> list[int]:
         """Get Telegram IDs that can approve user access."""
-        import os
-
-        superuser_ids: list[int] = []
-        for value in os.getenv("SUPERUSER_IDS", "").split(","):
-            value = value.strip()
-            if value.isdigit():
-                superuser_ids.append(int(value))
-
-        if superuser_ids:
-            return superuser_ids
-
         try:
-            results = self.db.execute_query("SELECT id FROM admins", fetch_all=True) or []
+            results = self.db.execute_query(
+                "SELECT id FROM users WHERE is_superuser = TRUE",
+                fetch_all=True,
+            ) or []
             return [row["id"] for row in results]
         except Exception as e:
-            print(f"Error loading admin ids: {e}")
+            print(f"Error loading superuser ids: {e}")
             return []
 
     def is_admin(self, user_id: int) -> bool:

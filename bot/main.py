@@ -212,20 +212,16 @@ class MessengerBot:
                         print("✅ Created user_last_groups table")
 
                     cur.execute("""
-                        SELECT EXISTS (
-                            SELECT FROM information_schema.tables
-                            WHERE table_name = 'admins'
-                        );
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_name = 'users' AND column_name = 'is_superuser'
+                            ) THEN
+                                ALTER TABLE users ADD COLUMN is_superuser BOOLEAN NOT NULL DEFAULT FALSE;
+                            END IF;
+                        END $$;
                     """)
-                    admins_exists = cur.fetchone()[0]
-                    if not admins_exists:
-                        cur.execute("""
-                            CREATE TABLE admins (
-                                id BIGINT NOT NULL PRIMARY KEY
-                            );
-                        """)
-                        logger.info("✅ Created admins table")
-                        print("✅ Created admins table")
                     
                     conn.commit()
             finally:

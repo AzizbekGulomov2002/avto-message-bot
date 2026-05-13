@@ -29,7 +29,6 @@ class Config:
     
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "debug")
-    SUPERUSER_IDS: str = os.getenv("SUPERUSER_IDS", "")
     
     @property
     def database_url(self) -> str:

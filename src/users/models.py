@@ -14,6 +14,7 @@ class User(models.Model):
     full_name = models.CharField(max_length=200, null=True, blank=True)
     phone = models.CharField(max_length=20, null=True, blank=True)
     active_until = models.DateTimeField(null=True, blank=True)
+    is_superuser = models.BooleanField(default=False)
     
     class Meta:
         db_table = 'users'
@@ -62,14 +63,6 @@ class User(models.Model):
             return date_format(self.active_until, "SHORT_DATETIME_FORMAT")
         return "-"
 
-    def get_superuser_display(self):
-        """Get superuser display."""
-        from users.superusers import is_superuser_id
-
-        if is_superuser_id(self.id):
-            return format_html('<span style="color: green;">True</span>')
-        return format_html('<span style="color: gray;">False</span>')
-
 
 class IsActiveFilter(SimpleListFilter):
     """Custom filter for is_active status."""
@@ -102,13 +95,10 @@ class IsSuperuserFilter(SimpleListFilter):
         )
 
     def queryset(self, request, queryset):
-        from users.superusers import get_superuser_ids
-
-        superuser_ids = list(get_superuser_ids())
         if self.value() == '1':
-            return queryset.filter(id__in=superuser_ids) if superuser_ids else queryset.none()
+            return queryset.filter(is_superuser=True)
         if self.value() == '0':
-            return queryset.exclude(id__in=superuser_ids) if superuser_ids else queryset
+            return queryset.filter(is_superuser=False)
         return queryset
 
 
@@ -132,7 +122,7 @@ class IsAuthenticatedFilter(SimpleListFilter):
 
 
 class UserAdminForm(forms.ModelForm):
-    """Custom form for User admin with is_active and is_authenticated as BooleanFields."""
+    """Custom form for User admin with editable status fields."""
     is_active = forms.BooleanField(
         label='Is Active',
         required=False,
@@ -173,16 +163,16 @@ class UserAdmin(admin.ModelAdmin):
         'id',
         'full_name',
         'phone',
-        'get_superuser_display',
+        'is_superuser',
         'get_status_display',
         'get_auth_display',
         'get_active_until_display',
     )
+    list_editable = ('is_superuser',)
     list_filter = (IsSuperuserFilter, IsActiveFilter, IsAuthenticatedFilter)
     search_fields = ('id', 'full_name', 'phone')
     readonly_fields = (
         'id',
-        'get_superuser_display',
         'get_status_display',
         'get_auth_display',
         'get_active_until_display',
@@ -190,18 +180,13 @@ class UserAdmin(admin.ModelAdmin):
     
     fieldsets = (
         ('Basic Information', {
-            'fields': ('id', 'full_name', 'phone', 'get_superuser_display', 'is_active', 'is_authenticated')
+            'fields': ('id', 'full_name', 'phone', 'is_superuser', 'is_active', 'is_authenticated')
         }),
         ('Subscription', {
             'fields': ('active_until',)
         }),
     )
     
-    def get_superuser_display(self, obj):
-        """Display superuser flag in admin."""
-        return obj.get_superuser_display()
-    get_superuser_display.short_description = 'Superuser'
-
     def get_status_display(self, obj):
         """Display status in admin."""
         return obj.get_status_display()
