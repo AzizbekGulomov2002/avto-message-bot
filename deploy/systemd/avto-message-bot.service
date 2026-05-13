@@ -1,0 +1,17 @@
+[Unit]
+Description=Avto Message Bot Telegram service
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/home/avto-message-bot
+EnvironmentFile=/home/avto-message-bot/.env
+ExecStart=/home/avto-message-bot/env/bin/python -m bot.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

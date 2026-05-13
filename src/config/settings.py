@@ -5,22 +5,36 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env file
-load_dotenv()
-
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 # BASE_DIR is the config directory (where settings.py is located)
 BASE_DIR = Path(__file__).resolve().parent
 # PROJECT_ROOT is the project root (python-messanger-bot)
 PROJECT_ROOT = BASE_DIR.parent.parent
 
+# Load environment variables from the project root.
+load_dotenv(PROJECT_ROOT / '.env')
+
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-change-this-in-production')
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = os.getenv('DJANGO_DEBUG', 'True') == 'True'
+DEBUG = os.getenv('DJANGO_DEBUG', 'False').lower() in ('true', '1', 'yes')
 
-ALLOWED_HOSTS = ["*"]
+allowed_hosts = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1')
+ALLOWED_HOSTS = [host.strip() for host in allowed_hosts.split(',') if host.strip()]
+if not ALLOWED_HOSTS:
+    ALLOWED_HOSTS = ['*']
+
+csrf_trusted_origins = os.getenv('DJANGO_CSRF_TRUSTED_ORIGINS', '')
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in csrf_trusted_origins.split(',')
+    if origin.strip()
+]
+
+if os.getenv('DJANGO_USE_PROXY', 'False').lower() in ('true', '1', 'yes'):
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    USE_X_FORWARDED_HOST = True
 
 # Application definition
 INSTALLED_APPS = [
@@ -31,7 +45,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'users',
+    'users.apps.UsersConfig',
     'messages.apps.MessagesConfig',
 ]
 

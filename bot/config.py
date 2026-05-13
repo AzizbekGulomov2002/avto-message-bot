@@ -1,10 +1,10 @@
 """Configuration management for the bot."""
 import os
-from typing import Optional
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Load .env file
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+load_dotenv(PROJECT_ROOT / '.env')
 
 
 class Config:
