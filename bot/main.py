@@ -8,10 +8,11 @@ if str(project_root) not in sys.path:
     sys.path.insert(0, str(project_root))
 
 import asyncio
+import calendar
 import logging
 import threading
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, Optional, Set
 import pytz
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, KeyboardButton, ReplyKeyboardMarkup
@@ -61,6 +62,7 @@ class MessengerBot:
         self.scheduler = AsyncIOScheduler(timezone=TASHKENT_TZ)
         self.last_sent_times: Dict[int, datetime] = {}  # Track last sent time for each scheduled message
         self.last_sent_lock = threading.Lock()
+        self.activation_request_sent: Set[int] = set()
         self.scheduler.start()
         
         # Validate APP_ID and APP_HASH
@@ -182,17 +184,48 @@ class MessengerBot:
                             WHERE table_name = 'user_last_groups'
                         );
                     """)
-                    exists = cur.fetchone()[0]
-                    
-                    if not exists:
+                    table_exists = cur.fetchone()[0]
+
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.columns
+                            WHERE table_name = 'user_last_groups' AND column_name = 'group_id'
+                        );
+                    """)
+                    has_group_id_column = cur.fetchone()[0]
+
+                    if table_exists and not has_group_id_column:
+                        cur.execute("DROP TABLE user_last_groups")
+                        table_exists = False
+                        logger.info("Recreated user_last_groups table with updated schema")
+                        print("Recreated user_last_groups table with updated schema")
+
+                    if not table_exists:
                         cur.execute("""
-                            CREATE TABLE IF NOT EXISTS user_last_groups (
-                                user_id BIGINT NOT NULL PRIMARY KEY,
-                                group_ids BIGINT[] NOT NULL DEFAULT '{}'
+                            CREATE TABLE user_last_groups (
+                                user_id BIGINT NOT NULL,
+                                group_id BIGINT NOT NULL,
+                                PRIMARY KEY (user_id, group_id)
                             );
                         """)
                         logger.info("✅ Created user_last_groups table")
                         print("✅ Created user_last_groups table")
+
+                    cur.execute("""
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables
+                            WHERE table_name = 'admins'
+                        );
+                    """)
+                    admins_exists = cur.fetchone()[0]
+                    if not admins_exists:
+                        cur.execute("""
+                            CREATE TABLE admins (
+                                id BIGINT NOT NULL PRIMARY KEY
+                            );
+                        """)
+                        logger.info("✅ Created admins table")
+                        print("✅ Created admins table")
                     
                     conn.commit()
             finally:
@@ -229,6 +262,223 @@ class MessengerBot:
         logger.info("=" * 60)
         print("=" * 60)
         return True
+
+    def _is_superuser(self, user_id: int) -> bool:
+        """Return whether the Telegram user can approve access."""
+        return self.user_storage.is_admin(user_id)
+
+    def _awaiting_activation_message(self) -> str:
+        """Message shown to users waiting for admin approval."""
+        return (
+            "✅ Akkauntingiz tasdiqlandi.\n\n"
+            "Admin kirish huquqini ko'rib chiqmoqda. Tasdiqlangandan keyin sizga xabar beriladi."
+        )
+
+    def _shift_access_calendar_month(self, year: int, month: int, offset: int) -> tuple[int, int]:
+        """Move calendar month by offset."""
+        month += offset
+        while month < 1:
+            month += 12
+            year -= 1
+        while month > 12:
+            month -= 12
+            year += 1
+        return year, month
+
+    def _build_access_calendar_keyboard(self, target_user_id: int, year: int, month: int) -> InlineKeyboardMarkup:
+        """Build inline calendar for superuser access approval."""
+        prev_year, prev_month = self._shift_access_calendar_month(year, month, -1)
+        next_year, next_month = self._shift_access_calendar_month(year, month, 1)
+        month_name = calendar.month_name[month]
+
+        keyboard = [[
+            InlineKeyboardButton("◀️", callback_data=f"access_cal_{target_user_id}_{prev_year}_{prev_month}"),
+            InlineKeyboardButton(f"{month_name} {year}", callback_data="access_ignore"),
+            InlineKeyboardButton("▶️", callback_data=f"access_cal_{target_user_id}_{next_year}_{next_month}"),
+        ]]
+
+        for week in calendar.monthcalendar(year, month):
+            row = []
+            for day in week:
+                if day == 0:
+                    continue
+                date_value = f"{year}-{month:02d}-{day:02d}"
+                row.append(
+                    InlineKeyboardButton(
+                        str(day),
+                        callback_data=f"access_day_{target_user_id}_{date_value}"
+                    )
+                )
+            if row:
+                keyboard.append(row)
+
+        keyboard.append([
+            InlineKeyboardButton("❌ Rad etish", callback_data=f"access_reject_{target_user_id}")
+        ])
+        return InlineKeyboardMarkup(keyboard)
+
+    async def _notify_superusers_about_activation_request(self, user_id: int):
+        """Send activation request with calendar to superusers."""
+        if user_id in self.activation_request_sent:
+            return
+
+        user = self.user_storage.get_user(user_id)
+        if not user or user.auth != 1 or user.status != 0:
+            return
+
+        superusers = self.user_storage.get_superuser_ids()
+        if not superusers:
+            logger.warning(f"No superusers configured for activation request of user {user_id}")
+            return
+
+        now = datetime.now(TASHKENT_TZ)
+        text = (
+            "🆕 Yangi foydalanuvchi aktivatsiya kutmoqda\n\n"
+            f"ID: {user.id}\n"
+            f"Ism: {user.full_name or '—'}\n"
+            f"Telefon: {user.phone or '—'}\n\n"
+            "Qaysi sanagacha aktiv qilasiz?"
+        )
+        reply_markup = self._build_access_calendar_keyboard(user.id, now.year, now.month)
+
+        for superuser_id in superusers:
+            try:
+                await self.application.bot.send_message(superuser_id, text, reply_markup=reply_markup)
+            except Exception as e:
+                logger.error(f"Failed to notify superuser {superuser_id} about user {user_id}: {e}")
+
+        self.activation_request_sent.add(user_id)
+
+    async def _maybe_request_activation_review(self, user_id: int):
+        """Notify superusers once the user finished authentication."""
+        user = self.user_storage.get_user(user_id)
+        if not user or user.auth != 1 or user.status != 0:
+            return
+        if not user.full_name:
+            return
+        await self._notify_superusers_about_activation_request(user_id)
+
+    async def _activate_user_access(self, target_user_id: int, active_until: datetime, admin_chat_id: int):
+        """Activate user until selected date and notify both sides."""
+        active_until = active_until.astimezone(TASHKENT_TZ)
+        if not self.user_storage.activate_user_until(target_user_id, active_until):
+            await self.application.bot.send_message(admin_chat_id, "⚠️ Foydalanuvchini aktivlashtirib bo'lmadi.")
+            return
+
+        active_until_text = active_until.strftime("%d.%m.%Y")
+        await self.application.bot.send_message(
+            admin_chat_id,
+            f"✅ Foydalanuvchi {target_user_id} {active_until_text} gacha aktiv qilindi."
+        )
+        await self.application.bot.send_message(
+            target_user_id,
+            f"✅ Akkauntingiz aktiv qilindi. Kirish muddati: {active_until_text} gacha.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📤 Xabar yuborish", callback_data="action_send_message"),
+                InlineKeyboardButton("📋 Xabarlar jadvali", callback_data="action_messages_table"),
+            ], [
+                InlineKeyboardButton("📹 Video qo'llanma", callback_data="action_video_tutorial"),
+            ]])
+        )
+
+    async def _reject_user_access(self, target_user_id: int, admin_chat_id: int):
+        """Reject pending user activation."""
+        await self.application.bot.send_message(
+            admin_chat_id,
+            f"❌ Foydalanuvchi {target_user_id} uchun aktivatsiya rad etildi."
+        )
+        await self.application.bot.send_message(
+            target_user_id,
+            "❌ Akkauntingiz aktivatsiyasi rad etildi. Qo'shimcha ma'lumot uchun @system24admin bilan bog'laning."
+        )
+
+    async def _handle_access_approval_callback(self, query, data: str):
+        """Handle superuser activation calendar callbacks."""
+        admin_id = query.from_user.id
+        if not self._is_superuser(admin_id):
+            await query.answer("Bu amal faqat superuser uchun.", show_alert=True)
+            return
+
+        if data == "access_ignore":
+            await query.answer()
+            return
+
+        if data.startswith("access_cal_"):
+            parts = data.split("_")
+            target_user_id = int(parts[2])
+            year = int(parts[3])
+            month = int(parts[4])
+            await query.edit_message_reply_markup(
+                reply_markup=self._build_access_calendar_keyboard(target_user_id, year, month)
+            )
+            return
+
+        if data.startswith("access_day_"):
+            parts = data.split("_")
+            target_user_id = int(parts[2])
+            date_value = parts[3]
+            selected_date = datetime.strptime(date_value, "%Y-%m-%d").date()
+            active_until = TASHKENT_TZ.localize(
+                datetime.combine(selected_date, datetime.max.time().replace(microsecond=0))
+            )
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ Tasdiqlash",
+                        callback_data=f"access_confirm_{target_user_id}_{date_value}"
+                    ),
+                    InlineKeyboardButton(
+                        "⬅️ Orqaga",
+                        callback_data=f"access_back_cal_{target_user_id}_{selected_date.year}_{selected_date.month}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton(
+                        "❌ Rad etish",
+                        callback_data=f"access_reject_{target_user_id}"
+                    )
+                ],
+            ])
+            await query.edit_message_text(
+                f"📅 Foydalanuvchi {target_user_id} {selected_date.strftime('%d.%m.%Y')} gacha aktiv qilinsinmi?",
+                reply_markup=keyboard
+            )
+            return
+
+        if data.startswith("access_back_cal_"):
+            parts = data.split("_")
+            target_user_id = int(parts[3])
+            year = int(parts[4])
+            month = int(parts[5])
+            user = self.user_storage.get_user(target_user_id)
+            text = (
+                "🆕 Yangi foydalanuvchi aktivatsiya kutmoqda\n\n"
+                f"ID: {target_user_id}\n"
+                f"Ism: {user.full_name if user and user.full_name else '—'}\n"
+                f"Telefon: {user.phone if user and user.phone else '—'}\n\n"
+                "Qaysi sanagacha aktiv qilasiz?"
+            )
+            await query.edit_message_text(
+                text,
+                reply_markup=self._build_access_calendar_keyboard(target_user_id, year, month)
+            )
+            return
+
+        if data.startswith("access_confirm_"):
+            parts = data.split("_")
+            target_user_id = int(parts[2])
+            date_value = parts[3]
+            selected_date = datetime.strptime(date_value, "%Y-%m-%d").date()
+            active_until = TASHKENT_TZ.localize(
+                datetime.combine(selected_date, datetime.max.time().replace(microsecond=0))
+            )
+            await self._activate_user_access(target_user_id, active_until, query.message.chat_id)
+            return
+
+        if data.startswith("access_reject_"):
+            target_user_id = int(data.split("_")[2])
+            await self._reject_user_access(target_user_id, query.message.chat_id)
+            return
     
     def _register_handlers(self):
         """Register bot handlers."""
@@ -302,9 +552,37 @@ class MessengerBot:
             
             return client
     
+    async def _reset_telegram_session(self, user_id: int):
+        """Remove stale Telethon session before a fresh login attempt."""
+        client = self.clients.pop(user_id, None)
+        if client:
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception as e:
+                logger.warning(f"[CLIENT] Could not disconnect stale client for user {user_id}: {e}")
+
+        sessions_dir = Path(__file__).resolve().parent / "sessions"
+        for suffix in ("", "-journal"):
+            session_path = sessions_dir / f"tg_session_{user_id}.session{suffix}"
+            if session_path.exists():
+                session_path.unlink()
+                logger.info(f"[CLIENT] Removed stale session file: {session_path}")
+
+    def _code_request_prompt(self, code_length: int = 5) -> str:
+        """User-facing instructions after Telegram sends a login code."""
+        formatted_code_hint = " ".join(["X"] * code_length)
+        return (
+            "📝 Telegram akkauntingizga yangi kod yuborildi.\n\n"
+            f"Faqat oxirgi kelgan kodni kiriting (masalan: {formatted_code_hint}).\n"
+            "⚠️ Kodni boshqa joyga yubormang va eski kodni qayta ishlatmang.\n"
+            "⚠️ Kodni bo'shliqlar bilan yoki bo'shliqlarsiz kiritishingiz mumkin."
+        )
+
     async def _send_code_request(self, user_id: int, phone: str) -> bool:
         """Send code request to user's phone number."""
         try:
+            await self._reset_telegram_session(user_id)
             logger.info(f"[CODE REQUEST] Sending code request to phone {phone} for user {user_id}")
             print(f"[CODE REQUEST] Sending code request to phone {phone} for user {user_id}")
             
@@ -471,13 +749,9 @@ class MessengerBot:
             # User authenticated but not activated by admin
             logger.info(f"[START] User {user_id} is authenticated but not activated (status=0)")
             print(f"[START] User {user_id} is authenticated but not activated (status=0)")
-            await update.message.reply_text(
-                "✅ Akkaunt ochildi siz uchun.\n\n"
-                "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
-            )
+            await update.message.reply_text(self._awaiting_activation_message())
+            await self._maybe_request_activation_review(user_id)
             return
-        
-        # User is authenticated and activated - show main menu
         logger.info(f"[START] User {user_id} is authenticated and activated, showing main menu")
         print(f"[START] User {user_id} is authenticated and activated, showing main menu")
         await self._show_main_menu(chat_id)
@@ -496,10 +770,7 @@ class MessengerBot:
         # Check if user is active
         user = self.user_storage.get_user(user_id)
         if user and user.status == 0:
-            await update.message.reply_text(
-                "✅ Akkaunt ochildi siz uchun.\n\n"
-                "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
-            )
+            await update.message.reply_text(self._awaiting_activation_message())
             return
         
         # For all users, show contact message
@@ -556,11 +827,8 @@ class MessengerBot:
         code_sent = await self._send_code_request(user_id, formatted_phone)
         if code_sent:
             state.step = "waiting_for_code"
-            # Remove keyboard
             await update.message.reply_text(
-                f"📝 Telegram akkauntingizga kod yuborildi.\n\n"
-                f"Kodni kiriting (masalan: {' '.join(['X'] * 5)}):\n"
-                f"⚠️ Eslatma: Kodni bo'shliqlar bilan yoki bo'shliqlarsiz kiritishingiz mumkin.",
+                self._code_request_prompt(),
                 reply_markup=None
             )
         else:
@@ -757,11 +1025,8 @@ class MessengerBot:
             code_sent = await self._send_code_request(user_id, formatted_phone)
             if code_sent:
                 state.step = "waiting_for_code"
-                # Remove keyboard
                 await update.message.reply_text(
-                    f"📝 Telegram akkauntingizga kod yuborildi.\n\n"
-                    f"Kodni kiriting (masalan: {' '.join(['X'] * 5)}):\n"
-                    f"⚠️ Eslatma: Kodni bo'shliqlar bilan yoki bo'shliqlarsiz kiritishingiz mumkin.",
+                    self._code_request_prompt(),
                     reply_markup=None
                 )
             else:
@@ -773,8 +1038,7 @@ class MessengerBot:
             cleaned_code = ''.join(filter(str.isdigit, text))
             state.code = cleaned_code
             
-            logger.info(f"[CODE INPUT] User {user_id} entered code: {text} (cleaned: {cleaned_code})")
-            print(f"[CODE INPUT] User {user_id} entered code: {text} (cleaned: {cleaned_code})")
+            logger.info(f"[CODE INPUT] User {user_id} entered a login code ({len(cleaned_code)} digits)")
             
             if not cleaned_code or len(cleaned_code) < 4:
                 await update.message.reply_text("❌ Kod noto'g'ri formatda. Iltimos, faqat raqamlarni kiriting:")
@@ -802,22 +1066,39 @@ class MessengerBot:
                     await update.message.reply_text("✅ Autentifikatsiya muvaffaqiyatli!")
                     await self._show_main_menu(chat_id)
                 else:
-                    # User authenticated but not activated by admin (default status=0 for new users)
-                    await update.message.reply_text(
-                        "✅ Akkaunt ochildi siz uchun.\n\n"
-                        "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
-                    )
+                    await update.message.reply_text(self._awaiting_activation_message())
+                    await self._maybe_request_activation_review(user_id)
             elif result == "code_expired":
-                # Code expired, ask to resend
-                # Create keyboard with contact button
-                keyboard = [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]]
-                reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
-                await update.message.reply_text(
-                    "⏰ Kod eskirib qolgan. Yangi kod yuborish uchun telefon raqamingizni qayta yuboring yoki kiriting:",
-                    reply_markup=reply_markup
-                )
-                state.step = "waiting_for_phone"
-                state.phone_code_hash = None
+                code_sent = await self._send_code_request(user_id, state.phone)
+                if code_sent:
+                    state.step = "waiting_for_code"
+                    await update.message.reply_text(
+                        "⏰ Kod eskirib qolgan yoki allaqachon ishlatilgan.\n\n"
+                        f"{self._code_request_prompt()}"
+                    )
+                else:
+                    keyboard = [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]]
+                    reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+                    await update.message.reply_text(
+                        "⏰ Kod eskirib qolgan. Yangi kod yuborish uchun telefon raqamingizni qayta yuboring yoki kiriting:",
+                        reply_markup=reply_markup
+                    )
+                    state.step = "waiting_for_phone"
+                    state.phone_code_hash = None
+            elif result == "code_shared":
+                code_sent = await self._send_code_request(user_id, state.phone)
+                if code_sent:
+                    state.step = "waiting_for_code"
+                    await update.message.reply_text(
+                        "🔒 Telegram bu kodni xavfsizlik sababli rad etdi, chunki u allaqachon boshqa joyda ishlatilgan.\n\n"
+                        f"{self._code_request_prompt()}"
+                    )
+                else:
+                    await update.message.reply_text(
+                        "🔒 Telegram kirishni blokladi. Bir necha daqiqa kutib, telefon raqamingizni qayta yuboring."
+                    )
+                    state.step = "waiting_for_phone"
+                    state.phone_code_hash = None
             elif result == "code_invalid":
                 code_format = " ".join(["X"] * len(cleaned_code)) if cleaned_code else "X X X X X"
                 await update.message.reply_text(
@@ -863,11 +1144,8 @@ class MessengerBot:
                     await update.message.reply_text("✅ Autentifikatsiya muvaffaqiyatli!")
                     await self._show_main_menu(chat_id)
                 else:
-                    # User authenticated but not activated by admin (default status=0 for new users)
-                    await update.message.reply_text(
-                        "✅ Akkaunt ochildi siz uchun.\n\n"
-                        "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
-                    )
+                    await update.message.reply_text(self._awaiting_activation_message())
+                    await self._maybe_request_activation_review(user_id)
             else:
                 await update.message.reply_text(
                     "❌ Parol noto'g'ri. Iltimos, to'g'ri parolni kiriting:"
@@ -903,14 +1181,9 @@ class MessengerBot:
                 await update.message.reply_text("✅ Autentifikatsiya muvaffaqiyatli!")
                 await self._show_main_menu(chat_id)
             else:
-                # User authenticated but not activated by admin (default status=0 for new users)
-                await update.message.reply_text(
-                    "✅ Akkaunt ochildi siz uchun.\n\n"
-                    "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
-                )
+                await update.message.reply_text(self._awaiting_activation_message())
+                await self._maybe_request_activation_review(user_id)
             return
-        
-        # Handle pending message
         if state.step == "waiting_for_message":
             state.pending_message = text
             state.step = ""
@@ -934,11 +1207,7 @@ class MessengerBot:
                 )
                 return
             elif user.status == 0:
-                # Authenticated but not active
-                await update.message.reply_text(
-                    "✅ Akkaunt ochildi siz uchun.\n\n"
-                    "Endi @system24admin ga bog'lanib, akkauntingizni aktiv qildiring va habar yuborishni ishlating"
-                )
+                await update.message.reply_text(self._awaiting_activation_message())
                 return
             elif user.status == 1:
                 # User is authenticated and activated, show main menu
@@ -955,6 +1224,10 @@ class MessengerBot:
         data = query.data
         
         state = self.state_manager.get_state(user_id)
+        
+        if data.startswith(("access_cal_", "access_day_", "access_confirm_", "access_reject_", "access_back_cal_")) or data == "access_ignore":
+            await self._handle_access_approval_callback(query, data)
+            return
         
         # Main menu actions
         if data == "action_send_message":
@@ -1496,84 +1769,46 @@ class MessengerBot:
             )
     
     async def _authenticate_user(self, user_id: int, phone: str, code: str, phone_code_hash: Optional[str] = None, chat_id: Optional[int] = None) -> str:
-        """Authenticate user with phone and code. Returns: 'success', 'code_expired', 'code_invalid', or 'error'."""
+        """Authenticate user with phone and code."""
+        client = await self._get_or_create_client(user_id)
+        code_str = str(code).strip()
+
         try:
             logger.info(f"[AUTH] Starting authentication for user {user_id} with phone {phone}")
-            print(f"[AUTH] Starting authentication for user {user_id} with phone {phone}")
-            
-            client = await self._get_or_create_client(user_id)
             if not client.is_connected():
-                logger.info(f"[AUTH] Connecting Telegram client for user {user_id}")
-                print(f"[AUTH] Connecting Telegram client for user {user_id}")
                 await client.connect()
-            
-            logger.info(f"[AUTH] Signing in user {user_id} with code: {code} (hash: {phone_code_hash[:10] if phone_code_hash else 'None'}...)")
-            print(f"[AUTH] Signing in user {user_id} with code: {code} (hash: {phone_code_hash[:10] if phone_code_hash else 'None'}...)")
-            
-            # Ensure code is string and clean
-            code_str = str(code).strip()
-            
-            # Sign in with phone, code, and phone_code_hash
-            # Try with phone_code_hash first, if available
-            if phone_code_hash:
-                try:
-                    logger.info(f"[AUTH] Attempting sign_in with phone_code_hash")
-                    print(f"[AUTH] Attempting sign_in with phone_code_hash")
-                    await client.sign_in(phone, code_str, phone_code_hash=phone_code_hash)
-                except Exception as e:
-                    # If fails with hash, try without hash (sometimes hash expires but code is still valid)
-                    error_str = str(e).lower()
-                    if 'expired' in error_str or 'invalid' in error_str:
-                        logger.warning(f"[AUTH] Sign in with hash failed: {e}, trying without hash")
-                        print(f"[AUTH] Sign in with hash failed: {e}, trying without hash")
-                        # Try without hash as fallback
-                        await client.sign_in(phone, code_str)
-                    else:
-                        raise
-            else:
-                await client.sign_in(phone, code_str)
-            
-            logger.info(f"[AUTH] ✅ Authentication successful for user {user_id}")
-            print(f"[AUTH] ✅ Authentication successful for user {user_id}")
-            
-            # Send login message to user's Telegram account
+
+            if not phone_code_hash:
+                logger.warning(f"[AUTH] Missing phone_code_hash for user {user_id}")
+                return "code_expired"
+
+            logger.info(
+                f"[AUTH] Signing in user {user_id} with code length {len(code_str)} "
+                f"(hash: {phone_code_hash[:10]}...)"
+            )
+            await client.sign_in(phone, code_str, phone_code_hash=phone_code_hash)
+
+            logger.info(f"[AUTH] Authentication successful for user {user_id}")
             await self._send_login_message(user_id, client)
-            
             return "success"
         except PhoneCodeExpiredError as e:
-            # Code expired - but try without hash as fallback
-            logger.warning(f"[AUTH] ⏰ Code expired error for user {user_id}: {e}")
-            print(f"[AUTH] ⏰ Code expired error for user {user_id}: {e}")
-            # Try without hash as fallback (sometimes hash expires but code is still valid)
-            try:
-                logger.info(f"[AUTH] Retrying sign_in without phone_code_hash as fallback")
-                print(f"[AUTH] Retrying sign_in without phone_code_hash as fallback")
-                await client.sign_in(phone, code_str)
-                logger.info(f"[AUTH] ✅ Authentication successful (fallback) for user {user_id}")
-                print(f"[AUTH] ✅ Authentication successful (fallback) for user {user_id}")
-                await self._send_login_message(user_id, client)
-                return "success"
-            except Exception as fallback_error:
-                logger.error(f"[AUTH] Fallback also failed: {fallback_error}")
-                print(f"[AUTH] Fallback also failed: {fallback_error}")
-                return "code_expired"
+            logger.warning(f"[AUTH] Code expired for user {user_id}: {e}")
+            return "code_expired"
         except PhoneCodeInvalidError as e:
-            # Code invalid
-            logger.warning(f"[AUTH] ❌ Invalid code for user {user_id}: {e}")
-            print(f"[AUTH] ❌ Invalid code for user {user_id}: {e}")
+            logger.warning(f"[AUTH] Invalid code for user {user_id}: {e}")
             return "code_invalid"
         except SessionPasswordNeededError:
-            # Need password
             logger.info(f"[AUTH] Password required for user {user_id}")
-            print(f"[AUTH] Password required for user {user_id}")
             state = self.state_manager.get_state(user_id)
             state.step = "waiting_for_password"
             return "password_needed"
         except Exception as e:
-            logger.error(f"[AUTH] ❌ Authentication error for user {user_id}: {e}", exc_info=True)
-            print(f"[AUTH] ❌ Authentication error for user {user_id}: {e}")
-            import traceback
-            traceback.print_exc()
+            error_text = str(e).lower()
+            if any(token in error_text for token in ("shared", "previously", "confirmation code has expired")):
+                logger.warning(f"[AUTH] Login code rejected for user {user_id}: {e}")
+                return "code_shared" if "shared" in error_text or "previously" in error_text else "code_expired"
+
+            logger.error(f"[AUTH] Authentication error for user {user_id}: {e}", exc_info=True)
             return "error"
     
     async def _authenticate_user_password(self, user_id: int, password: str) -> bool:
@@ -1672,13 +1907,7 @@ class MessengerBot:
         
         # If editing existing message, skip loading
         if edit_message is None:
-            # Send loading sticker (hourglass)
-            loading_sticker_id = "CAACAgIAAxkBAAIBtWkQUvrsNGOuEjTcgp1Co7FmZ5SgAAJIhgACyZyBSFug5ep5mD9pNgQ"  # Hourglass sticker
-            try:
-                loading_msg = await self.application.bot.send_sticker(chat_id, sticker=loading_sticker_id)
-            except Exception:
-                # Fallback to text if sticker fails
-                loading_msg = await self.application.bot.send_message(chat_id, "⏳ Guruhlar yuklanmoqda...")
+            loading_msg = await self.application.bot.send_message(chat_id, "⏳ Guruhlar yuklanmoqda...")
         else:
             loading_msg = None
         
@@ -1819,11 +2048,12 @@ class MessengerBot:
                     logger.error(f"Error editing message: {e}")
                     # Fall through to send new message if edit fails
             
-            # Delete loading message if it exists
+            # Update loading message with group list when possible
             if loading_msg:
                 try:
-                    await loading_msg.delete()
-                except:
+                    await loading_msg.edit_text(text, reply_markup=reply_markup)
+                    return
+                except Exception:
                     pass
             
             # Send new message

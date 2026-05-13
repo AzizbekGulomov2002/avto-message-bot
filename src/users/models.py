@@ -139,9 +139,9 @@ class UserAdminForm(forms.ModelForm):
 class UserAdmin(admin.ModelAdmin):
     """User admin interface."""
     form = UserAdminForm
-    list_display = ('id', 'full_name', 'get_status_display', 'get_auth_display', 'get_active_until_display')
+    list_display = ('id', 'full_name', 'phone', 'get_status_display', 'get_auth_display', 'get_active_until_display')
     list_filter = (IsActiveFilter, IsAuthenticatedFilter)
-    search_fields = ('id', 'full_name')
+    search_fields = ('id', 'full_name', 'phone')
     readonly_fields = ('id', 'get_status_display', 'get_auth_display', 'get_active_until_display')
     
     fieldsets = (

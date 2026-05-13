@@ -243,16 +243,39 @@ class UserStorage:
             print(f"Error setting auth status: {e}")
             return False
     
+    def get_superuser_ids(self) -> list[int]:
+        """Get Telegram IDs that can approve user access."""
+        import os
+
+        superuser_ids: list[int] = []
+        for value in os.getenv("SUPERUSER_IDS", "").split(","):
+            value = value.strip()
+            if value.isdigit():
+                superuser_ids.append(int(value))
+
+        if superuser_ids:
+            return superuser_ids
+
+        try:
+            results = self.db.execute_query("SELECT id FROM admins", fetch_all=True) or []
+            return [row["id"] for row in results]
+        except Exception as e:
+            print(f"Error loading admin ids: {e}")
+            return []
+
     def is_admin(self, user_id: int) -> bool:
         """Check if user is admin."""
+        return user_id in self.get_superuser_ids()
+
+    def activate_user_until(self, user_id: int, active_until: datetime) -> bool:
+        """Activate user until the given datetime."""
         try:
-            result = self.db.execute_query(
-                "SELECT id FROM admins WHERE id = %s",
-                (user_id,),
-                fetch_one=True
+            self.db.execute_query(
+                "UPDATE users SET status = 1, active_until = %s WHERE id = %s",
+                (active_until, user_id)
             )
-            return result is not None
-        except Exception:
+            return True
+        except Exception as e:
+            print(f"Error activating user: {e}")
             return False
-    
 
