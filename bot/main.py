@@ -45,6 +45,7 @@ logger = logging.getLogger(__name__)
 
 # Tashkent timezone
 TASHKENT_TZ = pytz.timezone('Asia/Tashkent')
+GROUP_SEND_DELAY_SECONDS = 60
 
 
 class MessengerBot:
@@ -62,6 +63,8 @@ class MessengerBot:
         self.scheduler = AsyncIOScheduler(timezone=TASHKENT_TZ)
         self.last_sent_times: Dict[int, datetime] = {}  # Track last sent time for each scheduled message
         self.last_sent_lock = threading.Lock()
+        self.group_send_in_progress: Set[int] = set()
+        self.group_send_lock = threading.Lock()
         self.activation_request_sent: Set[int] = set()
         self.scheduler.start()
         
@@ -2066,7 +2069,115 @@ class MessengerBot:
             except:
                 pass
             await self.application.bot.send_message(chat_id, "⚠️ Guruhlarni yuklashda xatolik yuz berdi.")
-    
+
+    async def _notify_group_send_task_complete(
+        self,
+        user_id: int,
+        success_count: int,
+        failed_count: int,
+        total_groups: int,
+    ):
+        """Notify the user after a sequential group send task finishes."""
+        if success_count > 0 and failed_count == 0:
+            text = f"✅ {success_count} ta guruhga yuborish vazifasi tugadi."
+        elif success_count > 0:
+            text = (
+                f"✅ {success_count} ta guruhga yuborish vazifasi tugadi.\n"
+                f"⚠️ {failed_count} ta guruhga yuborishda xatolik yuz berdi."
+            )
+        else:
+            text = f"❌ {total_groups} ta guruhga yuborish vazifasi yakunlandi, lekin xabar yuborilmadi."
+
+        try:
+            await self.application.bot.send_message(user_id, text)
+        except Exception as e:
+            logger.error(f"[GROUP SEND] Failed to notify user {user_id}: {e}")
+
+    async def _send_message_to_groups_sequentially(
+        self,
+        user_id: int,
+        group_ids: list[int],
+        message_text: str,
+    ) -> tuple[int, int]:
+        """Send a message to groups one by one with a delay between each group."""
+        if not group_ids:
+            return 0, 0
+
+        client = await self._get_or_create_client(user_id)
+        if not client:
+            logger.warning(f"[GROUP SEND] No client for user {user_id}")
+            return 0, len(group_ids)
+
+        if not client.is_connected():
+            await client.connect()
+
+        success_count = 0
+        failed_count = 0
+
+        for index, group_id in enumerate(group_ids):
+            if index > 0:
+                await asyncio.sleep(GROUP_SEND_DELAY_SECONDS)
+
+            try:
+                await client.send_message(group_id, message_text)
+                success_count += 1
+                logger.info(f"[GROUP SEND] Sent message to group {group_id} for user {user_id}")
+            except AuthKeyUnregisteredError:
+                failed_count += 1
+                logger.warning(f"[GROUP SEND] Session expired for user {user_id} while sending to group {group_id}")
+                with self.clients_lock:
+                    if user_id in self.clients:
+                        try:
+                            if client.is_connected():
+                                await client.disconnect()
+                        except Exception:
+                            pass
+                        del self.clients[user_id]
+                break
+            except Exception as e:
+                failed_count += 1
+                logger.error(f"[GROUP SEND] Error sending to group {group_id} for user {user_id}: {e}")
+
+        return success_count, failed_count
+
+    async def _dispatch_sequential_group_send(
+        self,
+        user_id: int,
+        group_ids: list[int],
+        message_text: str,
+        scheduled_id: Optional[int] = None,
+        notify_on_complete: bool = True,
+    ):
+        """Run a sequential group send task and optionally notify the user."""
+        if scheduled_id is not None:
+            with self.group_send_lock:
+                if scheduled_id in self.group_send_in_progress:
+                    return
+                self.group_send_in_progress.add(scheduled_id)
+
+        try:
+            success_count, failed_count = await self._send_message_to_groups_sequentially(
+                user_id,
+                group_ids,
+                message_text,
+            )
+
+            if scheduled_id is not None and success_count > 0:
+                with self.last_sent_lock:
+                    self.last_sent_times[scheduled_id] = datetime.now(TASHKENT_TZ)
+
+            if notify_on_complete:
+                await self._notify_group_send_task_complete(
+                    user_id,
+                    success_count,
+                    failed_count,
+                    len(group_ids),
+                )
+        finally:
+            if scheduled_id is not None:
+                with self.group_send_lock:
+                    self.group_send_in_progress.discard(scheduled_id)
+
     async def _save_scheduled_message(self, chat_id: int, user_id: int):
         """Save scheduled message to database."""
         try:
@@ -2128,6 +2239,7 @@ class MessengerBot:
             # Store values before clearing
             message_text = state.pending_message
             groups_count = len(state.selected_groups)
+            group_ids = list(state.selected_groups.keys())
             
             # Insert groups
             try:
@@ -2161,30 +2273,14 @@ class MessengerBot:
                     logger.error(f"Error deleting scheduled message {scheduled_id} after group insert failure: {delete_error}")
                 raise e
             
-            # Send first message immediately
-            try:
-                client = await self._get_or_create_client(user_id)
-                if client:
-                    if not client.is_connected():
-                        await client.connect()
-                    
-                    # Send to all selected groups
-                    sent_count = 0
-                    for group_id in state.selected_groups.keys():
-                        try:
-                            await client.send_message(group_id, message_text)
-                            sent_count += 1
-                            logger.info(f"[SCHEDULED] First message sent immediately to group {group_id} for scheduled message {scheduled_id}")
-                        except Exception as e:
-                            logger.error(f"[SCHEDULED] Error sending first message to group {group_id}: {e}")
-                    
-                    # Update last sent time for tracking
-                    if sent_count > 0:
-                        from datetime import datetime
-                        with self.last_sent_lock:
-                            self.last_sent_times[scheduled_id] = datetime.now(TASHKENT_TZ)
-            except Exception as e:
-                logger.error(f"[SCHEDULED] Error sending first message: {e}")
+            asyncio.create_task(
+                self._dispatch_sequential_group_send(
+                    user_id,
+                    group_ids,
+                    message_text,
+                    scheduled_id=scheduled_id,
+                )
+            )
             
             # Format last message time
             expires_at_str = expires_at.strftime("%Y-%m-%d %H:%M")
@@ -2198,8 +2294,7 @@ class MessengerBot:
                 f"⏰ Duration: {selected_duration['display_text']}\n"
                 f"👥 Guruhlar: {groups_count} ta\n"
                 f"📅 Oxirgi xabar: {expires_at_str}\n\n"
-                f"✅ Birinchi xabar darhol yuborildi!\n"
-                f"Xabar avtomatik ravishda yuboriladi."
+                f"📤 Guruhlarga xabar ketma-ket yuboriladi. Tugagach, sizga xabar beriladi."
             )
             
             # Clear pending data
@@ -2220,47 +2315,32 @@ class MessengerBot:
             )
     
     async def _send_message_to_groups(self, chat_id: int, user_id: int):
-        """Send message to selected groups immediately."""
+        """Send message to selected groups sequentially."""
         state = self.state_manager.get_state(user_id)
         
         if not state.pending_message or not state.selected_groups:
             await self.application.bot.send_message(chat_id, "⚠️ Xabar yoki guruhlar tanlanmagan!")
             return
         
-        # Get or create client
-        client = await self._get_or_create_client(user_id)
-        if not client:
-            await self.application.bot.send_message(chat_id, "⚠️ Telegram klienti ishga tushmadi.")
-            return
+        group_ids = list(state.selected_groups.keys())
+        message_text = state.pending_message
         
-        if not client.is_connected():
-            await client.connect()
-        
-        # Send message to all selected groups
-        success_count = 0
-        failed_count = 0
-        
-        for group_id in state.selected_groups.keys():
-            try:
-                await client.send_message(group_id, state.pending_message)
-                success_count += 1
-            except Exception as e:
-                logger.error(f"Error sending to group {group_id}: {e}")
-                failed_count += 1
-        
-        # Show result
-        if success_count > 0:
-            result_text = f"✅ Xabar {success_count} ta guruhga muvaffaqiyatli yuborildi!"
-            if failed_count > 0:
-                result_text += f"\n⚠️ {failed_count} ta guruhga yuborishda xatolik yuz berdi."
-        else:
-            result_text = "❌ Hech qanday guruhga xabar yuborilmadi."
-        
-        await self.application.bot.send_message(chat_id, result_text)
-        
-        # Clear pending data
+        # Clear pending data before background send starts
         state.pending_message = ""
         state.selected_groups = {}
+        
+        asyncio.create_task(
+            self._dispatch_sequential_group_send(
+                user_id,
+                group_ids,
+                message_text,
+            )
+        )
+        
+        await self.application.bot.send_message(
+            chat_id,
+            "📤 Tanlangan guruhlarga xabar ketma-ket yuborilmoqda. Tugagach, sizga xabar beriladi."
+        )
         
         # Show main menu
         await self._show_main_menu(chat_id)
@@ -2413,7 +2493,6 @@ class MessengerBot:
                             should_send = True
                     
                     if should_send:
-                        # Get groups for this scheduled message
                         groups_query = """
                             SELECT group_id
                             FROM scheduled_message_groups
@@ -2423,71 +2502,20 @@ class MessengerBot:
                         
                         if not groups:
                             continue
-                        
-                        # Get or create client for user
-                        client = await self._get_or_create_client(user_id)
-                        if not client:
-                            logger.warning(f"[SCHEDULED] No client for user {user_id}")
-                            continue
-                        
-                        # Try to connect and verify session
-                        try:
-                            if not client.is_connected():
-                                await client.connect()
-                            
-                            # Verify session is valid
-                            try:
-                                await client.get_me()
-                            except AuthKeyUnregisteredError:
-                                # Session expired, but don't delete it - just skip this send
-                                logger.warning(f"[SCHEDULED] Session expired for user {user_id}, skipping message {scheduled_id}")
-                                # Remove client from memory but keep session file
-                                with self.clients_lock:
-                                    if user_id in self.clients:
-                                        try:
-                                            if client.is_connected():
-                                                await client.disconnect()
-                                        except:
-                                            pass
-                                        del self.clients[user_id]
+
+                        with self.group_send_lock:
+                            if scheduled_id in self.group_send_in_progress:
                                 continue
-                        except Exception as e:
-                            logger.error(f"[SCHEDULED] Error connecting client for user {user_id}: {e}")
-                            continue
-                        
-                        # Send message to all groups
-                        success_count = 0
-                        failed_count = 0
-                        
-                        for group_row in groups:
-                            group_id = group_row['group_id']
-                            try:
-                                await client.send_message(group_id, message_text)
-                                success_count += 1
-                                logger.info(f"[SCHEDULED] Sent message {scheduled_id} to group {group_id}")
-                            except AuthKeyUnregisteredError:
-                                # Session expired during send, but keep session file
-                                failed_count += 1
-                                logger.warning(f"[SCHEDULED] Session expired for user {user_id} while sending to group {group_id}")
-                                # Remove client from memory but keep session file
-                                with self.clients_lock:
-                                    if user_id in self.clients:
-                                        try:
-                                            if client.is_connected():
-                                                await client.disconnect()
-                                        except:
-                                            pass
-                                        del self.clients[user_id]
-                                break  # Stop trying to send to other groups
-                            except Exception as e:
-                                failed_count += 1
-                                logger.error(f"[SCHEDULED] Error sending to group {group_id}: {e}")
-                        
-                        if success_count > 0:
-                            logger.info(f"[SCHEDULED] Sent message {scheduled_id} to {success_count} groups (failed: {failed_count})")
-                            # Update last sent time
-                            with self.last_sent_lock:
-                                self.last_sent_times[scheduled_id] = now
+
+                        group_ids = [group_row['group_id'] for group_row in groups]
+                        asyncio.create_task(
+                            self._dispatch_sequential_group_send(
+                                user_id,
+                                group_ids,
+                                message_text,
+                                scheduled_id=scheduled_id,
+                            )
+                        )
                         
                         # Check if message has expired
                         if expires_at:
