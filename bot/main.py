@@ -13,10 +13,11 @@ import logging
 import threading
 import uuid
 from datetime import datetime, timedelta
+from functools import wraps
 from typing import Dict, Optional, Set
 import pytz
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, KeyboardButton, ReplyKeyboardMarkup
+from telegram import Message, Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, KeyboardButton, ReplyKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -42,11 +43,13 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+logging.getLogger("telethon").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Tashkent timezone
 TASHKENT_TZ = pytz.timezone('Asia/Tashkent')
 GROUP_STAGGER_SECONDS = 5
+SCHEDULED_CHECK_SECONDS = 15
 
 
 class MessengerBot:
@@ -107,7 +110,7 @@ class MessengerBot:
         self.scheduler.add_job(
             self._send_scheduled_messages,
             'interval',
-            seconds=GROUP_STAGGER_SECONDS,
+            seconds=SCHEDULED_CHECK_SECONDS,
             id='send_scheduled_messages'
         )
     
@@ -511,13 +514,51 @@ class MessengerBot:
             await self._reject_user_access(target_user_id, query.message.chat_id)
             return
     
+    def _with_loading_sticker(self, handler):
+        """Show a loading sticker while a handler is processing."""
+        @wraps(handler)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            chat_id = update.effective_chat.id
+            loading_message = await self._send_loading_indicator(chat_id)
+            try:
+                return await handler(update, context)
+            finally:
+                await self._clear_loading_indicator(loading_message)
+
+        return wrapper
+
+    async def _send_loading_indicator(self, chat_id: int) -> Optional[Message]:
+        if self.config.LOADING_STICKER_FILE_ID:
+            try:
+                return await self.application.bot.send_sticker(
+                    chat_id,
+                    self.config.LOADING_STICKER_FILE_ID,
+                )
+            except Exception as e:
+                logger.warning(f"[LOADING] Failed to send loading sticker: {e}")
+
+        try:
+            return await self.application.bot.send_message(chat_id, "⏳")
+        except Exception as e:
+            logger.warning(f"[LOADING] Failed to send loading indicator: {e}")
+            return None
+
+    async def _clear_loading_indicator(self, message: Optional[Message]):
+        if not message:
+            return
+
+        try:
+            await message.delete()
+        except Exception:
+            pass
+
     def _register_handlers(self):
         """Register bot handlers."""
-        self.application.add_handler(CommandHandler("start", self.handle_start))
-        self.application.add_handler(CommandHandler("admin", self.handle_admin))
-        self.application.add_handler(CallbackQueryHandler(self.handle_callback))
+        self.application.add_handler(CommandHandler("start", self._with_loading_sticker(self.handle_start)))
+        self.application.add_handler(CommandHandler("admin", self._with_loading_sticker(self.handle_admin)))
+        self.application.add_handler(CallbackQueryHandler(self._with_loading_sticker(self.handle_callback)))
         # Handle contact messages (phone number sharing)
-        self.application.add_handler(MessageHandler(filters.CONTACT, self.handle_contact))
+        self.application.add_handler(MessageHandler(filters.CONTACT, self._with_loading_sticker(self.handle_contact)))
         # Handle video messages (for getting file_id)
         self.application.add_handler(MessageHandler(filters.VIDEO, self.handle_video_message))
         self.application.add_handler(MessageHandler(filters.Document.VIDEO, self.handle_video_document))
@@ -529,59 +570,61 @@ class MessengerBot:
     async def _get_or_create_client(self, user_id: int) -> Optional[TelegramClient]:
         """Get or create Telegram client for user. Sessions are preserved and restored automatically."""
         with self.clients_lock:
-            if user_id in self.clients:
-                client = self.clients[user_id]
-                # Verify client is still valid
-                try:
-                    if not client.is_connected():
-                        await client.connect()
-                    # Quick check if session is valid
-                    try:
-                        await client.get_me()
-                        return client
-                    except (AuthKeyUnregisteredError, Exception):
-                        # Session might be expired, but keep it and try to reconnect
-                        logger.warning(f"[CLIENT] Session check failed for user {user_id}, but keeping session file")
-                        pass
-                except Exception as e:
-                    logger.warning(f"[CLIENT] Error checking client for user {user_id}: {e}")
-                return client
-            
-            # Validate APP_ID and APP_HASH before creating client
-            logger.info(f"[CLIENT] Creating/restoring Telegram client for user {user_id}")
-            logger.info(f"[CLIENT] APP_ID: {self.config.APP_ID}, APP_HASH: {'*' * (len(self.config.APP_HASH) - 4) + self.config.APP_HASH[-4:] if len(self.config.APP_HASH) > 4 else '****'}")
-            print(f"[CLIENT] Creating/restoring Telegram client for user {user_id}")
-            print(f"[CLIENT] APP_ID: {self.config.APP_ID}")
-            print(f"[CLIENT] APP_HASH: {'*' * (len(self.config.APP_HASH) - 4) + self.config.APP_HASH[-4:] if len(self.config.APP_HASH) > 4 else '****'}")
-            
-            # Create sessions directory if it doesn't exist (inside bot folder)
-            import os
-            from pathlib import Path
-            bot_dir = Path(__file__).resolve().parent
-            sessions_dir = bot_dir / "sessions"
-            if not sessions_dir.exists():
-                sessions_dir.mkdir(exist_ok=True)
-                logger.info(f"[CLIENT] Created sessions directory: {sessions_dir}")
-                print(f"[CLIENT] Created sessions directory: {sessions_dir}")
-            
-            # Create new client with session file in sessions directory
-            # Session file will be loaded if it exists, or created if it doesn't
-            session_file = str(sessions_dir / f"tg_session_{user_id}.session")
-            session_exists = os.path.exists(session_file)
-            logger.info(f"[CLIENT] Session file path: {session_file} (exists: {session_exists})")
-            print(f"[CLIENT] Session file path: {session_file} (exists: {session_exists})")
-            
-            client = TelegramClient(session_file, self.config.APP_ID, self.config.APP_HASH)
-            self.clients[user_id] = client
-            
-            if session_exists:
-                logger.info(f"[CLIENT] ✅ Telegram client restored from existing session for user {user_id}")
-                print(f"[CLIENT] ✅ Telegram client restored from existing session for user {user_id}")
-            else:
-                logger.info(f"[CLIENT] ✅ Telegram client created successfully for user {user_id}")
-                print(f"[CLIENT] ✅ Telegram client created successfully for user {user_id}")
-            
-            return client
+            client = self.clients.get(user_id)
+            if client is None:
+                logger.info(f"[CLIENT] Creating/restoring Telegram client for user {user_id}")
+                logger.info(
+                    f"[CLIENT] APP_ID: {self.config.APP_ID}, APP_HASH: "
+                    f"{'*' * (len(self.config.APP_HASH) - 4) + self.config.APP_HASH[-4:] if len(self.config.APP_HASH) > 4 else '****'}"
+                )
+                print(f"[CLIENT] Creating/restoring Telegram client for user {user_id}")
+                print(f"[CLIENT] APP_ID: {self.config.APP_ID}")
+                print(
+                    f"[CLIENT] APP_HASH: "
+                    f"{'*' * (len(self.config.APP_HASH) - 4) + self.config.APP_HASH[-4:] if len(self.config.APP_HASH) > 4 else '****'}"
+                )
+
+                import os
+                from pathlib import Path
+                bot_dir = Path(__file__).resolve().parent
+                sessions_dir = bot_dir / "sessions"
+                if not sessions_dir.exists():
+                    sessions_dir.mkdir(exist_ok=True)
+                    logger.info(f"[CLIENT] Created sessions directory: {sessions_dir}")
+                    print(f"[CLIENT] Created sessions directory: {sessions_dir}")
+
+                session_file = str(sessions_dir / f"tg_session_{user_id}.session")
+                session_exists = os.path.exists(session_file)
+                logger.info(f"[CLIENT] Session file path: {session_file} (exists: {session_exists})")
+                print(f"[CLIENT] Session file path: {session_file} (exists: {session_exists})")
+
+                client = TelegramClient(
+                    session_file,
+                    self.config.APP_ID,
+                    self.config.APP_HASH,
+                    receive_updates=False,
+                )
+                self.clients[user_id] = client
+
+                if session_exists:
+                    logger.info(f"[CLIENT] ✅ Telegram client restored from existing session for user {user_id}")
+                    print(f"[CLIENT] ✅ Telegram client restored from existing session for user {user_id}")
+                else:
+                    logger.info(f"[CLIENT] ✅ Telegram client created successfully for user {user_id}")
+                    print(f"[CLIENT] ✅ Telegram client created successfully for user {user_id}")
+
+        try:
+            if not client.is_connected():
+                await client.connect()
+
+            try:
+                await client.get_me()
+            except (AuthKeyUnregisteredError, Exception):
+                logger.warning(f"[CLIENT] Session check failed for user {user_id}, but keeping session file")
+        except Exception as e:
+            logger.warning(f"[CLIENT] Error checking client for user {user_id}: {e}")
+
+        return client
     
     async def _reset_telegram_session(self, user_id: int):
         """Remove stale Telethon session before a fresh login attempt."""
@@ -1962,17 +2005,7 @@ class MessengerBot:
                 # Try to restore session by reconnecting
                 try:
                     with self.clients_lock:
-                        if user_id in self.clients:
-                            client = self.clients[user_id]
-                            try:
-                                if client.is_connected():
-                                    await client.disconnect()
-                            except:
-                                pass
-                            # Remove from memory but keep session files
-                            del self.clients[user_id]
-                    
-                    # Try to reconnect with existing session file
+                        self.clients.pop(user_id, None)
                     client = await self._get_or_create_client(user_id)
                     if client:
                         try:
@@ -2748,6 +2781,9 @@ class MessengerBot:
 
                         delay_seconds = max(0.0, (send_at - now).total_seconds())
                         cycle_key = (scheduled_id, group_id, cycle_index)
+                        with self.group_send_lock:
+                            if cycle_key in self.active_group_cycles:
+                                continue
                         asyncio.create_task(
                             self._send_group_after_delay(
                                 user_id,
@@ -2795,16 +2831,14 @@ class MessengerBot:
                 print(f"[CHAT MEMBER] User {user_id} left or blocked the bot. Session will be preserved.")
                 # Just disconnect client from memory, but keep session files
                 with self.clients_lock:
-                    if user_id in self.clients:
-                        try:
-                            client = self.clients[user_id]
-                            if client.is_connected():
-                                await client.disconnect()
-                        except:
-                            pass
-                        # Remove from memory but keep session files on disk
-                        del self.clients[user_id]
-                        logger.info(f"[CHAT MEMBER] Client removed from memory for user {user_id}, but session files preserved")
+                    client = self.clients.pop(user_id, None)
+                if client:
+                    try:
+                        if client.is_connected():
+                            await client.disconnect()
+                    except Exception:
+                        pass
+                    logger.info(f"[CHAT MEMBER] Client removed from memory for user {user_id}, but session files preserved")
         except Exception as e:
             logger.error(f"Error handling chat member update: {e}", exc_info=True)
     

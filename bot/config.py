@@ -26,6 +26,7 @@ class Config:
     # Video Tutorial
     VIDEO_TUTORIAL_PATH: str = os.getenv("VIDEO_TUTORIAL_PATH", "video.mp4")
     VIDEO_TUTORIAL_FILE_ID: str = (os.getenv("VIDEO_TUTORIAL_FILE_ID", "") or "").strip()
+    LOADING_STICKER_FILE_ID: str = (os.getenv("LOADING_STICKER_FILE_ID", "") or "").strip()
     
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "debug")
