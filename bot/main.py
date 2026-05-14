@@ -67,6 +67,8 @@ class MessengerBot:
         self.group_send_lock = threading.Lock()
         self.active_group_cycles: Set[tuple[int, int, int]] = set()
         self.send_batches: Dict[str, Dict] = {}
+        self.schedule_notified_ids: Set[int] = set()
+        self.schedule_final_outcomes: Dict[int, Dict] = {}
         self.activation_request_sent: Set[int] = set()
         self.scheduler.start()
         
@@ -2168,6 +2170,90 @@ class MessengerBot:
 
         return send_at, cycle_index
 
+    def _schedule_last_cycle_index(
+        self,
+        created_at: datetime,
+        interval_minutes: int,
+        expires_at: datetime,
+        max_offset_seconds: int,
+    ) -> int:
+        created_at_tz = self._ensure_tz(created_at)
+        expires_at_tz = self._ensure_tz(expires_at)
+        interval_seconds = interval_minutes * 60
+        duration_seconds = (expires_at_tz - created_at_tz).total_seconds() - max_offset_seconds
+        if duration_seconds <= 0:
+            return 0
+        return max(0, int(duration_seconds // interval_seconds))
+
+    async def _track_scheduled_final_cycle_outcome(
+        self,
+        scheduled_id: int,
+        user_id: int,
+        group_id: int,
+        cycle_index: int,
+        success: bool,
+    ):
+        with self.group_send_lock:
+            if scheduled_id in self.schedule_notified_ids:
+                return
+
+        message = self.db.execute_query(
+            """
+            SELECT created_at, expires_at, interval_minutes
+            FROM scheduled_messages
+            WHERE id = %s
+            """,
+            (scheduled_id,),
+            fetch_one=True,
+        )
+        if not message:
+            return
+
+        group_offsets = self._load_group_offsets_from_db(scheduled_id)
+        if not group_offsets:
+            return
+
+        max_offset_seconds = max(offset for _, offset in group_offsets)
+        last_cycle_index = self._schedule_last_cycle_index(
+            message['created_at'],
+            int(message['interval_minutes']),
+            message['expires_at'],
+            max_offset_seconds,
+        )
+        if cycle_index != last_cycle_index:
+            return
+
+        notify_payload = None
+        with self.group_send_lock:
+            if scheduled_id in self.schedule_notified_ids:
+                return
+
+            outcome = self.schedule_final_outcomes.setdefault(
+                scheduled_id,
+                {
+                    'user_id': user_id,
+                    'results': {},
+                    'total': len(group_offsets),
+                },
+            )
+            outcome['results'][group_id] = success
+            if len(outcome['results']) < outcome['total']:
+                return
+
+            self.schedule_notified_ids.add(scheduled_id)
+            self.schedule_final_outcomes.pop(scheduled_id, None)
+            success_count = sum(1 for result in outcome['results'].values() if result)
+            failed_count = outcome['total'] - success_count
+            notify_payload = (
+                outcome['user_id'],
+                success_count,
+                failed_count,
+                outcome['total'],
+            )
+
+        if notify_payload:
+            await self._notify_group_send_task_complete(*notify_payload)
+
     async def _record_send_batch_result(self, batch_id: Optional[str], success: bool):
         """Record one group result and notify the user when the batch is complete."""
         if not batch_id:
@@ -2277,6 +2363,15 @@ class MessengerBot:
             cycle_key=cycle_key,
         )
         await self._record_send_batch_result(batch_id, success)
+        if scheduled_id is not None:
+            cycle_index = cycle_key[2] if cycle_key else 0
+            await self._track_scheduled_final_cycle_outcome(
+                scheduled_id,
+                user_id,
+                group_id,
+                cycle_index,
+                success,
+            )
 
     def _dispatch_staggered_group_send(
         self,
@@ -2284,11 +2379,14 @@ class MessengerBot:
         group_offsets: list[tuple[int, int]],
         message_text: str,
         scheduled_id: Optional[int] = None,
-        notify_on_complete: bool = True,
+        notify_on_complete: Optional[bool] = None,
     ):
         """Schedule parallel staggered sends for a group batch."""
         if not group_offsets:
             return
+
+        if notify_on_complete is None:
+            notify_on_complete = scheduled_id is None
 
         batch_id = self._create_send_batch(user_id, len(group_offsets), notify_on_complete)
         for group_id, offset_seconds in group_offsets:
