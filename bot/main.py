@@ -11,6 +11,7 @@ import asyncio
 import calendar
 import logging
 import threading
+import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Optional, Set
 import pytz
@@ -45,7 +46,7 @@ logger = logging.getLogger(__name__)
 
 # Tashkent timezone
 TASHKENT_TZ = pytz.timezone('Asia/Tashkent')
-GROUP_SEND_DELAY_SECONDS = 60
+GROUP_STAGGER_SECONDS = 5
 
 
 class MessengerBot:
@@ -63,8 +64,9 @@ class MessengerBot:
         self.scheduler = AsyncIOScheduler(timezone=TASHKENT_TZ)
         self.last_sent_times: Dict[int, datetime] = {}  # Track last sent time for each scheduled message
         self.last_sent_lock = threading.Lock()
-        self.group_send_in_progress: Set[int] = set()
         self.group_send_lock = threading.Lock()
+        self.active_group_cycles: Set[tuple[int, int, int]] = set()
+        self.send_batches: Dict[str, Dict] = {}
         self.activation_request_sent: Set[int] = set()
         self.scheduler.start()
         
@@ -103,7 +105,7 @@ class MessengerBot:
         self.scheduler.add_job(
             self._send_scheduled_messages,
             'interval',
-            minutes=1,
+            seconds=GROUP_STAGGER_SECONDS,
             id='send_scheduled_messages'
         )
     
@@ -179,6 +181,29 @@ class MessengerBot:
                                     END IF;
                                 END $$;
                             """)
+
+                    cur.execute("""
+                        DO $$
+                        BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_name = 'scheduled_message_groups'
+                                  AND column_name = 'send_offset_seconds'
+                            ) THEN
+                                ALTER TABLE scheduled_message_groups
+                                ADD COLUMN send_offset_seconds INTEGER NOT NULL DEFAULT 0;
+                            END IF;
+
+                            IF NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_name = 'scheduled_message_groups'
+                                  AND column_name = 'last_sent_at'
+                            ) THEN
+                                ALTER TABLE scheduled_message_groups
+                                ADD COLUMN last_sent_at TIMESTAMPTZ;
+                            END IF;
+                        END $$;
+                    """)
                     
                     # Check and create user_last_groups table
                     cur.execute("""
@@ -2070,6 +2095,155 @@ class MessengerBot:
                 pass
             await self.application.bot.send_message(chat_id, "⚠️ Guruhlarni yuklashda xatolik yuz berdi.")
 
+    def _create_send_batch(self, user_id: int, total_groups: int, notify_on_complete: bool) -> str:
+        """Track a staggered group send batch for completion notification."""
+        batch_id = str(uuid.uuid4())
+        with self.group_send_lock:
+            self.send_batches[batch_id] = {
+                'user_id': user_id,
+                'total': total_groups,
+                'done': 0,
+                'success': 0,
+                'failed': 0,
+                'notify': notify_on_complete,
+            }
+        return batch_id
+
+    async def _record_send_batch_result(self, batch_id: Optional[str], success: bool):
+        """Record one group result and notify the user when the batch is complete."""
+        if not batch_id:
+            return
+
+        batch = None
+        with self.group_send_lock:
+            batch = self.send_batches.get(batch_id)
+            if not batch:
+                return
+
+            batch['done'] += 1
+            if success:
+                batch['success'] += 1
+            else:
+                batch['failed'] += 1
+
+            if batch['done'] < batch['total']:
+                return
+
+            self.send_batches.pop(batch_id, None)
+
+        if batch['notify']:
+            await self._notify_group_send_task_complete(
+                batch['user_id'],
+                batch['success'],
+                batch['failed'],
+                batch['total'],
+            )
+
+    async def _execute_group_send(
+        self,
+        user_id: int,
+        group_id: int,
+        message_text: str,
+        scheduled_id: Optional[int] = None,
+        cycle_key: Optional[tuple[int, int, int]] = None,
+    ) -> bool:
+        """Send one message to a single group."""
+        if cycle_key is not None:
+            with self.group_send_lock:
+                if cycle_key in self.active_group_cycles:
+                    return False
+                self.active_group_cycles.add(cycle_key)
+
+        try:
+            client = await self._get_or_create_client(user_id)
+            if not client:
+                logger.warning(f"[GROUP SEND] No client for user {user_id}")
+                return False
+
+            if not client.is_connected():
+                await client.connect()
+
+            await client.send_message(group_id, message_text)
+            logger.info(f"[GROUP SEND] Sent message to group {group_id} for user {user_id}")
+
+            if scheduled_id is not None:
+                self.db.execute_query(
+                    """
+                    UPDATE scheduled_message_groups
+                    SET last_sent_at = %s
+                    WHERE scheduled_id = %s AND group_id = %s
+                    """,
+                    (datetime.now(TASHKENT_TZ), scheduled_id, group_id),
+                )
+            return True
+        except AuthKeyUnregisteredError:
+            logger.warning(f"[GROUP SEND] Session expired for user {user_id} while sending to group {group_id}")
+            with self.clients_lock:
+                if user_id in self.clients:
+                    client = self.clients[user_id]
+                    try:
+                        if client.is_connected():
+                            await client.disconnect()
+                    except Exception:
+                        pass
+                    del self.clients[user_id]
+            return False
+        except Exception as e:
+            logger.error(f"[GROUP SEND] Error sending to group {group_id} for user {user_id}: {e}")
+            return False
+        finally:
+            if cycle_key is not None:
+                with self.group_send_lock:
+                    self.active_group_cycles.discard(cycle_key)
+
+    async def _send_group_after_delay(
+        self,
+        user_id: int,
+        group_id: int,
+        message_text: str,
+        delay_seconds: float,
+        batch_id: Optional[str],
+        scheduled_id: Optional[int] = None,
+        cycle_key: Optional[tuple[int, int, int]] = None,
+    ):
+        """Send to one group after a delay without blocking other groups."""
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+
+        success = await self._execute_group_send(
+            user_id,
+            group_id,
+            message_text,
+            scheduled_id=scheduled_id,
+            cycle_key=cycle_key,
+        )
+        await self._record_send_batch_result(batch_id, success)
+
+    def _dispatch_staggered_group_send(
+        self,
+        user_id: int,
+        group_offsets: list[tuple[int, int]],
+        message_text: str,
+        scheduled_id: Optional[int] = None,
+        notify_on_complete: bool = True,
+    ):
+        """Schedule parallel staggered sends for a group batch."""
+        if not group_offsets:
+            return
+
+        batch_id = self._create_send_batch(user_id, len(group_offsets), notify_on_complete)
+        for group_id, offset_seconds in group_offsets:
+            asyncio.create_task(
+                self._send_group_after_delay(
+                    user_id,
+                    group_id,
+                    message_text,
+                    float(offset_seconds),
+                    batch_id,
+                    scheduled_id=scheduled_id,
+                )
+            )
+
     async def _notify_group_send_task_complete(
         self,
         user_id: int,
@@ -2092,91 +2266,6 @@ class MessengerBot:
             await self.application.bot.send_message(user_id, text)
         except Exception as e:
             logger.error(f"[GROUP SEND] Failed to notify user {user_id}: {e}")
-
-    async def _send_message_to_groups_sequentially(
-        self,
-        user_id: int,
-        group_ids: list[int],
-        message_text: str,
-    ) -> tuple[int, int]:
-        """Send a message to groups one by one with a delay between each group."""
-        if not group_ids:
-            return 0, 0
-
-        client = await self._get_or_create_client(user_id)
-        if not client:
-            logger.warning(f"[GROUP SEND] No client for user {user_id}")
-            return 0, len(group_ids)
-
-        if not client.is_connected():
-            await client.connect()
-
-        success_count = 0
-        failed_count = 0
-
-        for index, group_id in enumerate(group_ids):
-            if index > 0:
-                await asyncio.sleep(GROUP_SEND_DELAY_SECONDS)
-
-            try:
-                await client.send_message(group_id, message_text)
-                success_count += 1
-                logger.info(f"[GROUP SEND] Sent message to group {group_id} for user {user_id}")
-            except AuthKeyUnregisteredError:
-                failed_count += 1
-                logger.warning(f"[GROUP SEND] Session expired for user {user_id} while sending to group {group_id}")
-                with self.clients_lock:
-                    if user_id in self.clients:
-                        try:
-                            if client.is_connected():
-                                await client.disconnect()
-                        except Exception:
-                            pass
-                        del self.clients[user_id]
-                break
-            except Exception as e:
-                failed_count += 1
-                logger.error(f"[GROUP SEND] Error sending to group {group_id} for user {user_id}: {e}")
-
-        return success_count, failed_count
-
-    async def _dispatch_sequential_group_send(
-        self,
-        user_id: int,
-        group_ids: list[int],
-        message_text: str,
-        scheduled_id: Optional[int] = None,
-        notify_on_complete: bool = True,
-    ):
-        """Run a sequential group send task and optionally notify the user."""
-        if scheduled_id is not None:
-            with self.group_send_lock:
-                if scheduled_id in self.group_send_in_progress:
-                    return
-                self.group_send_in_progress.add(scheduled_id)
-
-        try:
-            success_count, failed_count = await self._send_message_to_groups_sequentially(
-                user_id,
-                group_ids,
-                message_text,
-            )
-
-            if scheduled_id is not None and success_count > 0:
-                with self.last_sent_lock:
-                    self.last_sent_times[scheduled_id] = datetime.now(TASHKENT_TZ)
-
-            if notify_on_complete:
-                await self._notify_group_send_task_complete(
-                    user_id,
-                    success_count,
-                    failed_count,
-                    len(group_ids),
-                )
-        finally:
-            if scheduled_id is not None:
-                with self.group_send_lock:
-                    self.group_send_in_progress.discard(scheduled_id)
 
     async def _save_scheduled_message(self, chat_id: int, user_id: int):
         """Save scheduled message to database."""
@@ -2240,16 +2329,21 @@ class MessengerBot:
             message_text = state.pending_message
             groups_count = len(state.selected_groups)
             group_ids = list(state.selected_groups.keys())
+            group_offsets = [
+                (group_id, index * GROUP_STAGGER_SECONDS)
+                for index, group_id in enumerate(group_ids)
+            ]
             
             # Insert groups
             try:
-                for group_id in state.selected_groups.keys():
+                for group_id, offset_seconds in group_offsets:
                     group_insert_query = """
-                        INSERT INTO scheduled_message_groups (scheduled_id, group_id)
-                        VALUES (%s, %s)
-                        ON CONFLICT (scheduled_id, group_id) DO NOTHING
+                        INSERT INTO scheduled_message_groups (scheduled_id, group_id, send_offset_seconds)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (scheduled_id, group_id) DO UPDATE
+                        SET send_offset_seconds = EXCLUDED.send_offset_seconds
                     """
-                    self.db.execute_query(group_insert_query, (scheduled_id, group_id))
+                    self.db.execute_query(group_insert_query, (scheduled_id, group_id, offset_seconds))
                 
                 # Save user's last selected groups for future use
                 # First, delete old last groups for this user
@@ -2274,9 +2368,9 @@ class MessengerBot:
                 raise e
             
             asyncio.create_task(
-                self._dispatch_sequential_group_send(
+                self._dispatch_staggered_group_send(
                     user_id,
-                    group_ids,
+                    group_offsets,
                     message_text,
                     scheduled_id=scheduled_id,
                 )
@@ -2294,7 +2388,8 @@ class MessengerBot:
                 f"⏰ Duration: {selected_duration['display_text']}\n"
                 f"👥 Guruhlar: {groups_count} ta\n"
                 f"📅 Oxirgi xabar: {expires_at_str}\n\n"
-                f"📤 Guruhlarga xabar ketma-ket yuboriladi. Tugagach, sizga xabar beriladi."
+                f"📤 Guruhlarga xabar {GROUP_STAGGER_SECONDS} soniya oralig'ida ketma-ket yuboriladi. "
+                f"Tugagach, sizga xabar beriladi."
             )
             
             # Clear pending data
@@ -2315,7 +2410,7 @@ class MessengerBot:
             )
     
     async def _send_message_to_groups(self, chat_id: int, user_id: int):
-        """Send message to selected groups sequentially."""
+        """Send message to selected groups with a fixed stagger between them."""
         state = self.state_manager.get_state(user_id)
         
         if not state.pending_message or not state.selected_groups:
@@ -2324,22 +2419,27 @@ class MessengerBot:
         
         group_ids = list(state.selected_groups.keys())
         message_text = state.pending_message
+        group_offsets = [
+            (group_id, index * GROUP_STAGGER_SECONDS)
+            for index, group_id in enumerate(group_ids)
+        ]
         
         # Clear pending data before background send starts
         state.pending_message = ""
         state.selected_groups = {}
         
         asyncio.create_task(
-            self._dispatch_sequential_group_send(
+            self._dispatch_staggered_group_send(
                 user_id,
-                group_ids,
+                group_offsets,
                 message_text,
             )
         )
         
         await self.application.bot.send_message(
             chat_id,
-            "📤 Tanlangan guruhlarga xabar ketma-ket yuborilmoqda. Tugagach, sizga xabar beriladi."
+            f"📤 Tanlangan guruhlarga xabar {GROUP_STAGGER_SECONDS} soniya oralig'ida yuborilmoqda. "
+            f"Tugagach, sizga xabar beriladi."
         )
         
         # Show main menu
@@ -2419,22 +2519,17 @@ class MessengerBot:
             print(f"[PAYMENTS] Error checking expired payments: {e}")
     
     async def _send_scheduled_messages(self):
-        """Send scheduled messages based on intervals and duration."""
+        """Send scheduled messages per group on its own interval without blocking others."""
         try:
-            from datetime import datetime, timedelta
-            
             now = datetime.now(TASHKENT_TZ)
             
-            # Get all active scheduled messages that are not paused and not expired
             query = """
                 SELECT 
                     sm.id,
                     sm.user_id,
                     sm.message,
                     sm.interval_minutes,
-                    sm.created_at,
-                    sm.expires_at,
-                    sm.paused
+                    sm.expires_at
                 FROM scheduled_messages sm
                 WHERE sm.paused = FALSE
                   AND (sm.expires_at IS NULL OR sm.expires_at > %s)
@@ -2449,85 +2544,72 @@ class MessengerBot:
             if not messages:
                 return
             
-            logger.info(f"[SCHEDULED] Checking {len(messages)} scheduled messages")
-            
             for msg in messages:
                 try:
                     scheduled_id = msg['id']
                     user_id = msg['user_id']
                     message_text = msg['message']
-                    interval_minutes = msg['interval_minutes']
-                    created_at = msg['created_at']
+                    interval_minutes = int(msg['interval_minutes'])
                     expires_at = msg['expires_at']
                     
-                    # Check if user is active
                     user = self.user_storage.get_user(user_id)
                     if not user or user.status != 1 or user.auth != 1:
                         continue
                     
-                    # Calculate if it's time to send
-                    # Check last sent time to avoid duplicates
-                    with self.last_sent_lock:
-                        last_sent = self.last_sent_times.get(scheduled_id)
-                    
-                    # Calculate time since creation
-                    if created_at.tzinfo is None:
-                        created_at_tz = created_at.replace(tzinfo=TASHKENT_TZ)
-                    else:
-                        created_at_tz = created_at
-                    
-                    time_since_creation = now - created_at_tz
-                    total_minutes = int(time_since_creation.total_seconds() / 60)
-                    
-                    # Check if we should send now (every interval_minutes)
-                    should_send = False
-                    if last_sent is None:
-                        # First time sending - send if enough time has passed
-                        if total_minutes >= interval_minutes:
-                            should_send = True
-                    else:
-                        # Check if enough time has passed since last send
-                        time_since_last_sent = now - last_sent
-                        minutes_since_last = int(time_since_last_sent.total_seconds() / 60)
-                        if minutes_since_last >= interval_minutes:
-                            should_send = True
-                    
-                    if should_send:
-                        groups_query = """
-                            SELECT group_id
-                            FROM scheduled_message_groups
-                            WHERE scheduled_id = %s
-                        """
-                        groups = self.db.execute_query(groups_query, (scheduled_id,), fetch_all=True)
-                        
-                        if not groups:
+                    if expires_at:
+                        expires_at_tz = (
+                            expires_at.replace(tzinfo=TASHKENT_TZ)
+                            if expires_at.tzinfo is None
+                            else expires_at
+                        )
+                        if now >= expires_at_tz:
                             continue
-
-                        with self.group_send_lock:
-                            if scheduled_id in self.group_send_in_progress:
-                                continue
-
-                        group_ids = [group_row['group_id'] for group_row in groups]
+                    
+                    groups_query = """
+                        SELECT group_id, send_offset_seconds, last_sent_at
+                        FROM scheduled_message_groups
+                        WHERE scheduled_id = %s
+                        ORDER BY send_offset_seconds, group_id
+                    """
+                    groups = self.db.execute_query(groups_query, (scheduled_id,), fetch_all=True)
+                    
+                    if not groups:
+                        continue
+                    
+                    interval_delta = timedelta(minutes=interval_minutes)
+                    
+                    for group_row in groups:
+                        group_id = group_row['group_id']
+                        last_sent_at = group_row['last_sent_at']
+                        
+                        if last_sent_at is None:
+                            continue
+                        
+                        if last_sent_at.tzinfo is None:
+                            last_sent_at = last_sent_at.replace(tzinfo=TASHKENT_TZ)
+                        
+                        next_due_at = last_sent_at + interval_delta
+                        if now < next_due_at:
+                            continue
+                        
+                        cycle_key = (scheduled_id, group_id, int(next_due_at.timestamp()))
                         asyncio.create_task(
-                            self._dispatch_sequential_group_send(
+                            self._send_group_after_delay(
                                 user_id,
-                                group_ids,
+                                group_id,
                                 message_text,
+                                0.0,
+                                None,
                                 scheduled_id=scheduled_id,
+                                cycle_key=cycle_key,
                             )
                         )
-                        
-                        # Check if message has expired
-                        if expires_at:
-                            expires_at_tz = expires_at.replace(tzinfo=TASHKENT_TZ) if expires_at.tzinfo is None else expires_at
-                            if now >= expires_at_tz:
-                                # Message expired, remove from tracking
-                                with self.last_sent_lock:
-                                    self.last_sent_times.pop(scheduled_id, None)
-                                logger.info(f"[SCHEDULED] Message {scheduled_id} has expired")
                     
                 except Exception as e:
-                    logger.error(f"[SCHEDULED] Error processing scheduled message {msg.get('id', 'unknown')}: {e}", exc_info=True)
+                    logger.error(
+                        f"[SCHEDULED] Error processing scheduled message {msg.get('id', 'unknown')}: {e}",
+                        exc_info=True,
+                    )
                     
         except Exception as e:
             logger.error(f"[SCHEDULED] Error in scheduled messages job: {e}", exc_info=True)
