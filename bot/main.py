@@ -2109,6 +2109,65 @@ class MessengerBot:
             }
         return batch_id
 
+    def _ensure_tz(self, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=TASHKENT_TZ)
+        return value
+
+    def _build_group_offsets_from_selected(self, selected_groups: Dict[int, bool]) -> list[tuple[int, int]]:
+        group_ids = list(selected_groups.keys())
+        return [
+            (group_id, index * GROUP_STAGGER_SECONDS)
+            for index, group_id in enumerate(group_ids)
+        ]
+
+    def _load_group_offsets_from_db(self, scheduled_id: int) -> list[tuple[int, int]]:
+        rows = self.db.execute_query(
+            """
+            SELECT group_id, send_offset_seconds
+            FROM scheduled_message_groups
+            WHERE scheduled_id = %s
+            ORDER BY send_offset_seconds, group_id
+            """,
+            (scheduled_id,),
+            fetch_all=True,
+        ) or []
+
+        offsets = [
+            (int(row['group_id']), int(row.get('send_offset_seconds') or 0))
+            for row in rows
+        ]
+
+        if len(offsets) > 1 and all(offset == 0 for _, offset in offsets):
+            offsets = [
+                (group_id, index * GROUP_STAGGER_SECONDS)
+                for index, (group_id, _) in enumerate(offsets)
+            ]
+
+        return offsets
+
+    def _get_due_cycle_send_at(
+        self,
+        created_at: datetime,
+        interval_minutes: int,
+        send_offset_seconds: int,
+        now: datetime,
+    ) -> Optional[tuple[datetime, int]]:
+        created_at_tz = self._ensure_tz(created_at)
+        interval_seconds = interval_minutes * 60
+        elapsed_seconds = (now - created_at_tz).total_seconds()
+        if elapsed_seconds < send_offset_seconds:
+            return None
+
+        cycle_index = int((elapsed_seconds - send_offset_seconds) // interval_seconds)
+        send_at = created_at_tz + timedelta(
+            seconds=(cycle_index * interval_seconds) + send_offset_seconds
+        )
+        if now < send_at:
+            return None
+
+        return send_at, cycle_index
+
     async def _record_send_batch_result(self, batch_id: Optional[str], success: bool):
         """Record one group result and notify the user when the batch is complete."""
         if not batch_id:
@@ -2328,11 +2387,7 @@ class MessengerBot:
             # Store values before clearing
             message_text = state.pending_message
             groups_count = len(state.selected_groups)
-            group_ids = list(state.selected_groups.keys())
-            group_offsets = [
-                (group_id, index * GROUP_STAGGER_SECONDS)
-                for index, group_id in enumerate(group_ids)
-            ]
+            group_offsets = self._build_group_offsets_from_selected(state.selected_groups)
             
             # Insert groups
             try:
@@ -2367,13 +2422,12 @@ class MessengerBot:
                     logger.error(f"Error deleting scheduled message {scheduled_id} after group insert failure: {delete_error}")
                 raise e
             
-            asyncio.create_task(
-                self._dispatch_staggered_group_send(
-                    user_id,
-                    group_offsets,
-                    message_text,
-                    scheduled_id=scheduled_id,
-                )
+            group_offsets = self._load_group_offsets_from_db(scheduled_id)
+            self._dispatch_staggered_group_send(
+                user_id,
+                group_offsets,
+                message_text,
+                scheduled_id=scheduled_id,
             )
             
             # Format last message time
@@ -2417,23 +2471,17 @@ class MessengerBot:
             await self.application.bot.send_message(chat_id, "⚠️ Xabar yoki guruhlar tanlanmagan!")
             return
         
-        group_ids = list(state.selected_groups.keys())
+        group_offsets = self._build_group_offsets_from_selected(state.selected_groups)
         message_text = state.pending_message
-        group_offsets = [
-            (group_id, index * GROUP_STAGGER_SECONDS)
-            for index, group_id in enumerate(group_ids)
-        ]
         
         # Clear pending data before background send starts
         state.pending_message = ""
         state.selected_groups = {}
         
-        asyncio.create_task(
-            self._dispatch_staggered_group_send(
-                user_id,
-                group_offsets,
-                message_text,
-            )
+        self._dispatch_staggered_group_send(
+            user_id,
+            group_offsets,
+            message_text,
         )
         
         await self.application.bot.send_message(
@@ -2529,6 +2577,7 @@ class MessengerBot:
                     sm.user_id,
                     sm.message,
                     sm.interval_minutes,
+                    sm.created_at,
                     sm.expires_at
                 FROM scheduled_messages sm
                 WHERE sm.paused = FALSE
@@ -2550,6 +2599,7 @@ class MessengerBot:
                     user_id = msg['user_id']
                     message_text = msg['message']
                     interval_minutes = int(msg['interval_minutes'])
+                    created_at = msg['created_at']
                     expires_at = msg['expires_at']
                     
                     user = self.user_storage.get_user(user_id)
@@ -2576,29 +2626,36 @@ class MessengerBot:
                     if not groups:
                         continue
                     
-                    interval_delta = timedelta(minutes=interval_minutes)
-                    
                     for group_row in groups:
                         group_id = group_row['group_id']
                         last_sent_at = group_row['last_sent_at']
-                        
+                        send_offset_seconds = int(group_row.get('send_offset_seconds') or 0)
+
                         if last_sent_at is None:
                             continue
-                        
-                        if last_sent_at.tzinfo is None:
-                            last_sent_at = last_sent_at.replace(tzinfo=TASHKENT_TZ)
-                        
-                        next_due_at = last_sent_at + interval_delta
-                        if now < next_due_at:
+
+                        due_cycle = self._get_due_cycle_send_at(
+                            created_at,
+                            interval_minutes,
+                            send_offset_seconds,
+                            now,
+                        )
+                        if not due_cycle:
                             continue
-                        
-                        cycle_key = (scheduled_id, group_id, int(next_due_at.timestamp()))
+
+                        send_at, cycle_index = due_cycle
+                        last_sent_at = self._ensure_tz(last_sent_at)
+                        if last_sent_at >= send_at:
+                            continue
+
+                        delay_seconds = max(0.0, (send_at - now).total_seconds())
+                        cycle_key = (scheduled_id, group_id, cycle_index)
                         asyncio.create_task(
                             self._send_group_after_delay(
                                 user_id,
                                 group_id,
                                 message_text,
-                                0.0,
+                                delay_seconds,
                                 None,
                                 scheduled_id=scheduled_id,
                                 cycle_key=cycle_key,
