@@ -2188,14 +2188,16 @@ class MessengerBot:
         send_offset_seconds: int,
         now: datetime,
     ) -> Optional[tuple[datetime, int]]:
+        """First round starts one full interval after schedule creation."""
         created_at_tz = self._ensure_tz(created_at)
         interval_seconds = interval_minutes * 60
-        elapsed_seconds = (now - created_at_tz).total_seconds()
+        first_round_at = created_at_tz + timedelta(seconds=interval_seconds)
+        elapsed_seconds = (now - first_round_at).total_seconds()
         if elapsed_seconds < send_offset_seconds:
             return None
 
         cycle_index = int((elapsed_seconds - send_offset_seconds) // interval_seconds)
-        send_at = created_at_tz + timedelta(
+        send_at = first_round_at + timedelta(
             seconds=(cycle_index * interval_seconds) + send_offset_seconds
         )
         if now < send_at:
@@ -2210,10 +2212,10 @@ class MessengerBot:
         expires_at: datetime,
         max_offset_seconds: int,
     ) -> int:
-        created_at_tz = self._ensure_tz(created_at)
+        first_round_at = self._ensure_tz(created_at) + timedelta(minutes=interval_minutes)
         expires_at_tz = self._ensure_tz(expires_at)
         interval_seconds = interval_minutes * 60
-        duration_seconds = (expires_at_tz - created_at_tz).total_seconds() - max_offset_seconds
+        duration_seconds = (expires_at_tz - first_round_at).total_seconds() - max_offset_seconds
         if duration_seconds <= 0:
             return 0
         return max(0, int(duration_seconds // interval_seconds))
@@ -2553,14 +2555,6 @@ class MessengerBot:
                     logger.error(f"Error deleting scheduled message {scheduled_id} after group insert failure: {delete_error}")
                 raise e
             
-            group_offsets = self._load_group_offsets_from_db(scheduled_id)
-            self._dispatch_staggered_group_send(
-                user_id,
-                group_offsets,
-                message_text,
-                scheduled_id=scheduled_id,
-            )
-            
             # Format last message time
             expires_at_str = expires_at.strftime("%Y-%m-%d %H:%M")
             
@@ -2573,8 +2567,8 @@ class MessengerBot:
                 f"⏰ Duration: {selected_duration['display_text']}\n"
                 f"👥 Guruhlar: {groups_count} ta\n"
                 f"📅 Oxirgi xabar: {expires_at_str}\n\n"
-                f"📤 Guruhlarga xabar {GROUP_STAGGER_SECONDS} soniya oralig'ida ketma-ket yuboriladi. "
-                f"Tugagach, sizga xabar beriladi."
+                f"📤 Birinchi yuborish {selected_interval['display_text']} dan keyin boshlanadi. "
+                f"Guruhlar orasida {GROUP_STAGGER_SECONDS} soniya ketma-ket yuboriladi."
             )
             
             # Clear pending data
@@ -2762,9 +2756,6 @@ class MessengerBot:
                         last_sent_at = group_row['last_sent_at']
                         send_offset_seconds = int(group_row.get('send_offset_seconds') or 0)
 
-                        if last_sent_at is None:
-                            continue
-
                         due_cycle = self._get_due_cycle_send_at(
                             created_at,
                             interval_minutes,
@@ -2775,9 +2766,10 @@ class MessengerBot:
                             continue
 
                         send_at, cycle_index = due_cycle
-                        last_sent_at = self._ensure_tz(last_sent_at)
-                        if last_sent_at >= send_at:
-                            continue
+                        if last_sent_at is not None:
+                            last_sent_at = self._ensure_tz(last_sent_at)
+                            if last_sent_at >= send_at:
+                                continue
 
                         delay_seconds = max(0.0, (send_at - now).total_seconds())
                         cycle_key = (scheduled_id, group_id, cycle_index)
