@@ -1,17 +1,42 @@
 """Configuration management for the bot."""
+import logging
 import os
+import re
 from pathlib import Path
+
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / '.env')
+
+BOT_TOKEN_PATTERN = re.compile(r"^\d+:[A-Za-z0-9_-]+$")
+
+
+def normalize_bot_token(raw_token: str) -> str:
+    """Normalize BOT_TOKEN and fix common duplicate-id mistakes."""
+    token = (raw_token or "").strip()
+    if not token:
+        return ""
+
+    parts = token.split(":")
+    if len(parts) == 3 and parts[0].isdigit() and parts[0] == parts[1] and parts[2]:
+        fixed = f"{parts[0]}:{parts[2]}"
+        logger.warning(
+            "BOT_TOKEN contained duplicate bot id; auto-corrected to %s:***",
+            parts[0],
+        )
+        return fixed
+
+    return token
 
 
 class Config:
     """Bot configuration loaded from environment variables."""
     
     # Telegram Bot Configuration
-    BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+    BOT_TOKEN: str = normalize_bot_token(os.getenv("BOT_TOKEN", ""))
     APP_ID: int = int(os.getenv("APP_ID", "0"))
     APP_HASH: str = os.getenv("APP_HASH", "")
     
@@ -42,8 +67,16 @@ class Config:
     def validate(self) -> bool:
         """Validate that required configuration is present."""
         if not self.BOT_TOKEN:
+            logger.error("BOT_TOKEN is missing in .env")
+            return False
+        if not BOT_TOKEN_PATTERN.fullmatch(self.BOT_TOKEN):
+            logger.error(
+                "BOT_TOKEN format is invalid. Expected format from @BotFather: "
+                "123456789:AAHxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+            )
             return False
         if not self.APP_HASH:
+            logger.error("APP_HASH is missing in .env")
             return False
         return True
 

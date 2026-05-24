@@ -17,6 +17,9 @@ class UserState:
     groups_page: int = 1
     selected_interval_id: Optional[int] = None
     selected_duration_id: Optional[int] = None
+    admin_target_id: Optional[int] = None
+    admin_pending_name: str = ""
+    admin_pending_phone: Optional[str] = None
 
 
 class UserStateManager:

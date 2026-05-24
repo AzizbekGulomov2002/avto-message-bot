@@ -73,6 +73,7 @@ class MessengerBot:
         self.schedule_notified_ids: Set[int] = set()
         self.schedule_final_outcomes: Dict[int, Dict] = {}
         self.activation_request_sent: Set[int] = set()
+        self._bot_started = False
         self.scheduler.start()
         
         # Validate APP_ID and APP_HASH
@@ -332,16 +333,24 @@ class MessengerBot:
             year += 1
         return year, month
 
-    def _build_access_calendar_keyboard(self, target_user_id: int, year: int, month: int) -> InlineKeyboardMarkup:
-        """Build inline calendar for superuser access approval."""
+    def _build_deadline_calendar_keyboard(
+        self,
+        prefix: str,
+        target_user_id: int,
+        year: int,
+        month: int,
+        bottom_row: Optional[list] = None,
+    ) -> InlineKeyboardMarkup:
+        """Build inline calendar for selecting an active-until date."""
         prev_year, prev_month = self._shift_access_calendar_month(year, month, -1)
         next_year, next_month = self._shift_access_calendar_month(year, month, 1)
         month_name = calendar.month_name[month]
+        ignore_callback = f"{prefix}_ignore"
 
         keyboard = [[
-            InlineKeyboardButton("◀️", callback_data=f"access_cal_{target_user_id}_{prev_year}_{prev_month}"),
-            InlineKeyboardButton(f"{month_name} {year}", callback_data="access_ignore"),
-            InlineKeyboardButton("▶️", callback_data=f"access_cal_{target_user_id}_{next_year}_{next_month}"),
+            InlineKeyboardButton("◀️", callback_data=f"{prefix}_cal_{target_user_id}_{prev_year}_{prev_month}"),
+            InlineKeyboardButton(f"{month_name} {year}", callback_data=ignore_callback),
+            InlineKeyboardButton("▶️", callback_data=f"{prefix}_cal_{target_user_id}_{next_year}_{next_month}"),
         ]]
 
         for week in calendar.monthcalendar(year, month):
@@ -353,16 +362,65 @@ class MessengerBot:
                 row.append(
                     InlineKeyboardButton(
                         str(day),
-                        callback_data=f"access_day_{target_user_id}_{date_value}"
+                        callback_data=f"{prefix}_day_{target_user_id}_{date_value}"
                     )
                 )
             if row:
                 keyboard.append(row)
 
-        keyboard.append([
-            InlineKeyboardButton("❌ Rad etish", callback_data=f"access_reject_{target_user_id}")
-        ])
+        if bottom_row:
+            keyboard.append(bottom_row)
         return InlineKeyboardMarkup(keyboard)
+
+    def _build_access_calendar_keyboard(self, target_user_id: int, year: int, month: int) -> InlineKeyboardMarkup:
+        """Build inline calendar for superuser access approval."""
+        return self._build_deadline_calendar_keyboard(
+            "access",
+            target_user_id,
+            year,
+            month,
+            bottom_row=[
+                InlineKeyboardButton("❌ Rad etish", callback_data=f"access_reject_{target_user_id}")
+            ],
+        )
+
+    def _build_admin_add_calendar_keyboard(self, target_user_id: int, year: int, month: int) -> InlineKeyboardMarkup:
+        """Build inline calendar for superadmin user creation."""
+        return self._build_deadline_calendar_keyboard(
+            "admin_add",
+            target_user_id,
+            year,
+            month,
+            bottom_row=[
+                InlineKeyboardButton("❌ Bekor qilish", callback_data="admin_cancel_add")
+            ],
+        )
+
+    def _build_admin_menu_keyboard(self) -> InlineKeyboardMarkup:
+        """Superadmin panel buttons."""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ User qo'shish", callback_data="admin_add_user")],
+            [InlineKeyboardButton("🗑 User o'chirish", callback_data="admin_delete_user")],
+        ])
+
+    def _clear_admin_state(self, state: UserState):
+        """Reset superadmin form state."""
+        state.step = ""
+        state.admin_target_id = None
+        state.admin_pending_name = ""
+        state.admin_pending_phone = None
+
+    async def _show_admin_menu(self, chat_id: int, text: Optional[str] = None):
+        """Show superadmin management menu."""
+        message = text or (
+            "🛠 Superadmin panel\n\n"
+            "Foydalanuvchilarni qo'shish yoki o'chirish uchun tugmani tanlang."
+        )
+        await self.application.bot.send_message(
+            chat_id,
+            message,
+            reply_markup=self._build_admin_menu_keyboard(),
+        )
 
     async def _notify_superusers_about_activation_request(self, user_id: int):
         """Send activation request with calendar to superusers."""
@@ -530,6 +588,224 @@ class MessengerBot:
         if data.startswith("access_reject_"):
             target_user_id = int(data.split("_")[2])
             await self._reject_user_access(target_user_id, query.message.chat_id)
+            return
+
+    async def _finalize_admin_add_user(
+        self,
+        admin_id: int,
+        chat_id: int,
+        target_user_id: int,
+        active_until: datetime,
+        edit_message=None,
+    ):
+        """Save a user created from the superadmin panel."""
+        state = self.state_manager.get_state(admin_id)
+        full_name = state.admin_pending_name.strip()
+        phone = state.admin_pending_phone
+
+        if not full_name:
+            message = "⚠️ Ism familiya kiritilmagan. Qaytadan boshlang: /admin"
+            if edit_message:
+                await edit_message.edit_text(message)
+            else:
+                await self.application.bot.send_message(chat_id, message)
+            self._clear_admin_state(state)
+            return
+
+        if not self.user_storage.create_user_by_admin(
+            target_user_id,
+            full_name,
+            active_until.astimezone(TASHKENT_TZ),
+            phone=phone,
+        ):
+            message = "⚠️ Foydalanuvchini saqlab bo'lmadi."
+            if edit_message:
+                await edit_message.edit_text(message)
+            else:
+                await self.application.bot.send_message(chat_id, message)
+            self._clear_admin_state(state)
+            return
+
+        active_until_text = active_until.astimezone(TASHKENT_TZ).strftime("%d.%m.%Y")
+        phone_text = phone or "—"
+        message = (
+            "✅ Foydalanuvchi qo'shildi\n\n"
+            f"ID: {target_user_id}\n"
+            f"Ism: {full_name}\n"
+            f"Telefon: {phone_text}\n"
+            f"Muddat: {active_until_text} gacha"
+        )
+        if edit_message:
+            await edit_message.edit_text(message, reply_markup=self._build_admin_menu_keyboard())
+        else:
+            await self.application.bot.send_message(
+                chat_id,
+                message,
+                reply_markup=self._build_admin_menu_keyboard(),
+            )
+
+        try:
+            await self.application.bot.send_message(
+                target_user_id,
+                f"✅ Admin sizni tizimga qo'shdi.\n"
+                f"Kirish muddati: {active_until_text} gacha.\n\n"
+                f"Botdan foydalanish uchun /start bosing va telefon raqamingizni tasdiqlang.",
+            )
+        except Exception as e:
+            logger.warning(f"Could not notify newly added user {target_user_id}: {e}")
+
+        self._clear_admin_state(state)
+
+    async def _handle_admin_panel_callback(self, query, data: str):
+        """Handle superadmin panel callbacks."""
+        admin_id = query.from_user.id
+        chat_id = query.message.chat_id
+
+        if not self._is_superuser(admin_id):
+            await query.answer("Bu amal faqat superuser uchun.", show_alert=True)
+            return
+
+        state = self.state_manager.get_state(admin_id)
+
+        if data == "admin_ignore":
+            await query.answer()
+            return
+
+        if data == "admin_menu":
+            self._clear_admin_state(state)
+            await query.edit_message_text(
+                "🛠 Superadmin panel\n\n"
+                "Foydalanuvchilarni qo'shish yoki o'chirish uchun tugmani tanlang.",
+                reply_markup=self._build_admin_menu_keyboard(),
+            )
+            return
+
+        if data == "admin_add_user":
+            self._clear_admin_state(state)
+            state.step = "admin_waiting_user_id"
+            await query.edit_message_text(
+                "➕ Yangi foydalanuvchi qo'shish\n\n"
+                "Telegram ID ni kiriting:"
+            )
+            return
+
+        if data == "admin_delete_user":
+            self._clear_admin_state(state)
+            state.step = "admin_delete_waiting_user_id"
+            await query.edit_message_text(
+                "🗑 Foydalanuvchini o'chirish\n\n"
+                "O'chiriladigan foydalanuvchi Telegram ID sini kiriting:"
+            )
+            return
+
+        if data == "admin_cancel_add":
+            self._clear_admin_state(state)
+            await query.edit_message_text(
+                "❌ User qo'shish bekor qilindi.",
+                reply_markup=self._build_admin_menu_keyboard(),
+            )
+            return
+
+        if data.startswith("admin_add_cal_"):
+            parts = data.split("_")
+            target_user_id = int(parts[3])
+            year = int(parts[4])
+            month = int(parts[5])
+            await query.edit_message_reply_markup(
+                reply_markup=self._build_admin_add_calendar_keyboard(target_user_id, year, month)
+            )
+            return
+
+        if data.startswith("admin_add_day_"):
+            parts = data.split("_")
+            target_user_id = int(parts[3])
+            date_value = parts[4]
+            selected_date = datetime.strptime(date_value, "%Y-%m-%d").date()
+            phone_text = state.admin_pending_phone or "—"
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ Tasdiqlash",
+                        callback_data=f"admin_add_confirm_{target_user_id}_{date_value}"
+                    ),
+                    InlineKeyboardButton(
+                        "⬅️ Orqaga",
+                        callback_data=f"admin_add_back_cal_{target_user_id}_{selected_date.year}_{selected_date.month}"
+                    ),
+                ],
+                [
+                    InlineKeyboardButton("❌ Bekor qilish", callback_data="admin_cancel_add")
+                ],
+            ])
+            await query.edit_message_text(
+                "➕ Foydalanuvchini tasdiqlash\n\n"
+                f"ID: {target_user_id}\n"
+                f"Ism: {state.admin_pending_name}\n"
+                f"Telefon: {phone_text}\n"
+                f"Muddat: {selected_date.strftime('%d.%m.%Y')} gacha",
+                reply_markup=keyboard,
+            )
+            return
+
+        if data.startswith("admin_add_back_cal_"):
+            parts = data.split("_")
+            target_user_id = int(parts[4])
+            year = int(parts[5])
+            month = int(parts[6])
+            await query.edit_message_text(
+                f"📅 {target_user_id} uchun aktivlik muddatini tanlang:",
+                reply_markup=self._build_admin_add_calendar_keyboard(target_user_id, year, month),
+            )
+            return
+
+        if data.startswith("admin_add_confirm_"):
+            parts = data.split("_")
+            target_user_id = int(parts[3])
+            date_value = parts[4]
+            selected_date = datetime.strptime(date_value, "%Y-%m-%d").date()
+            active_until = TASHKENT_TZ.localize(
+                datetime.combine(selected_date, datetime.max.time().replace(microsecond=0))
+            )
+            await self._finalize_admin_add_user(
+                admin_id,
+                chat_id,
+                target_user_id,
+                active_until,
+                edit_message=query.message,
+            )
+            return
+
+        if data.startswith("admin_delete_confirm_"):
+            target_user_id = int(data.split("_")[3])
+            if target_user_id == admin_id:
+                await query.edit_message_text(
+                    "❌ O'zingizni o'chirolmaysiz.",
+                    reply_markup=self._build_admin_menu_keyboard(),
+                )
+                return
+
+            user = self.user_storage.get_user(target_user_id)
+            if not user:
+                await query.edit_message_text(
+                    "❌ Foydalanuvchi topilmadi.",
+                    reply_markup=self._build_admin_menu_keyboard(),
+                )
+                return
+
+            self._delete_user_session(target_user_id)
+            if not self.user_storage.delete_user_completely(target_user_id):
+                await query.edit_message_text(
+                    "⚠️ Foydalanuvchini o'chirib bo'lmadi.",
+                    reply_markup=self._build_admin_menu_keyboard(),
+                )
+                return
+
+            await query.edit_message_text(
+                f"✅ Foydalanuvchi o'chirildi\n\n"
+                f"ID: {target_user_id}\n"
+                f"Ism: {user.full_name or '—'}",
+                reply_markup=self._build_admin_menu_keyboard(),
+            )
             return
     
     def _with_loading_sticker(self, handler):
@@ -852,19 +1128,21 @@ class MessengerBot:
         user_id = update.effective_user.id
         chat_id = update.effective_chat.id
         
-        # Check if user is waiting for name input
         state = self.state_manager.get_state(user_id)
         if state.step == "waiting_for_name":
             await update.message.reply_text("Ism Familiyangiz:", reply_markup=None)
             return
+
+        if self._is_superuser(user_id):
+            self._clear_admin_state(state)
+            await self._show_admin_menu(chat_id)
+            return
         
-        # Check if user is active
         user = self.user_storage.get_user(user_id)
         if user and user.status == 0:
             await update.message.reply_text(self._awaiting_activation_message())
             return
         
-        # For all users, show contact message
         await update.message.reply_text("admin bilan bog'lanish: @system24admin")
     
     async def handle_contact(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1087,6 +1365,131 @@ class MessengerBot:
         text = update.message.text
         
         state = self.state_manager.get_state(user_id)
+        
+        if state.step == "admin_waiting_user_id":
+            if not self._is_superuser(user_id):
+                self._clear_admin_state(state)
+                return
+            try:
+                target_id = int(text.strip())
+            except ValueError:
+                await update.message.reply_text("❌ Telegram ID raqam bo'lishi kerak. Qayta kiriting:")
+                return
+            if target_id <= 0:
+                await update.message.reply_text("❌ Noto'g'ri Telegram ID. Qayta kiriting:")
+                return
+
+            state.admin_target_id = target_id
+            state.step = "admin_waiting_full_name"
+            await update.message.reply_text("👤 Ism familiyani kiriting:")
+            return
+
+        if state.step == "admin_waiting_full_name":
+            if not self._is_superuser(user_id):
+                self._clear_admin_state(state)
+                return
+            full_name = text.strip()
+            if not full_name:
+                await update.message.reply_text("❌ Ism familiya bo'sh bo'lishi mumkin emas. Qayta kiriting:")
+                return
+
+            state.admin_pending_name = full_name
+            state.step = "admin_waiting_phone"
+            await update.message.reply_text(
+                "📱 Telefon raqamni kiriting (+998901234567)\n"
+                "O'tkazib yuborish uchun - yuboring:"
+            )
+            return
+
+        if state.step == "admin_waiting_phone":
+            if not self._is_superuser(user_id):
+                self._clear_admin_state(state)
+                return
+
+            phone_input = text.strip()
+            if phone_input == "-":
+                state.admin_pending_phone = None
+            else:
+                phone = phone_input
+                if not phone.startswith("+998"):
+                    await update.message.reply_text(
+                        "❌ Telefon raqam +998 bilan boshlanishi kerak yoki - yuboring:"
+                    )
+                    return
+                remaining = phone[4:].replace(" ", "").replace("-", "")
+                if not remaining.isdigit() or len(remaining) != 9:
+                    await update.message.reply_text(
+                        "❌ Telefon raqam noto'g'ri. Masalan: +998901234567 yoki - yuboring:"
+                    )
+                    return
+                state.admin_pending_phone = f"+998{remaining}"
+
+            target_id = state.admin_target_id
+            if not target_id:
+                self._clear_admin_state(state)
+                await update.message.reply_text("⚠️ Jarayon buzildi. Qayta boshlang: /admin")
+                return
+
+            state.step = "admin_waiting_deadline"
+            now = datetime.now(TASHKENT_TZ)
+            await update.message.reply_text(
+                f"📅 {target_id} uchun aktivlik muddatini tanlang:",
+                reply_markup=self._build_admin_add_calendar_keyboard(target_id, now.year, now.month),
+            )
+            return
+
+        if state.step == "admin_delete_waiting_user_id":
+            if not self._is_superuser(user_id):
+                self._clear_admin_state(state)
+                return
+            try:
+                target_id = int(text.strip())
+            except ValueError:
+                await update.message.reply_text("❌ Telegram ID raqam bo'lishi kerak. Qayta kiriting:")
+                return
+
+            if target_id == user_id:
+                self._clear_admin_state(state)
+                await update.message.reply_text("❌ O'zingizni o'chirolmaysiz.")
+                return
+
+            user = self.user_storage.get_user(target_id)
+            if not user:
+                self._clear_admin_state(state)
+                await update.message.reply_text("❌ Foydalanuvchi topilmadi.")
+                return
+
+            active_until_text = "—"
+            if user.active_until:
+                active_until = user.active_until
+                if active_until.tzinfo is None:
+                    active_until = TASHKENT_TZ.localize(active_until)
+                active_until_text = active_until.strftime("%d.%m.%Y")
+
+            self._clear_admin_state(state)
+            keyboard = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton(
+                        "✅ Ha, o'chirish",
+                        callback_data=f"admin_delete_confirm_{target_id}",
+                    )
+                ],
+                [InlineKeyboardButton("❌ Bekor qilish", callback_data="admin_menu")],
+            ])
+            await update.message.reply_text(
+                "🗑 Foydalanuvchini o'chirishni tasdiqlang:\n\n"
+                f"ID: {user.id}\n"
+                f"Ism: {user.full_name or '—'}\n"
+                f"Telefon: {user.phone or '—'}\n"
+                f"Muddat: {active_until_text}",
+                reply_markup=keyboard,
+            )
+            return
+
+        if state.step == "admin_waiting_deadline":
+            if self._is_superuser(user_id):
+                await update.message.reply_text("📅 Muddatni kalendardan tanlang.")
+            return
         
         # Handle authentication flow
         if state.step == "waiting_for_phone":
@@ -1319,6 +1722,12 @@ class MessengerBot:
         
         if data.startswith(("access_cal_", "access_day_", "access_confirm_", "access_reject_", "access_back_cal_")) or data == "access_ignore":
             await self._handle_access_approval_callback(query, data)
+            return
+
+        if data.startswith((
+            "admin_add_", "admin_delete_", "admin_menu", "admin_cancel_add", "admin_ignore"
+        )):
+            await self._handle_admin_panel_callback(query, data)
             return
         
         # Main menu actions
@@ -2822,6 +3231,7 @@ class MessengerBot:
         await self.application.initialize()
         await self.application.start()
         await self.application.updater.start_polling(drop_pending_updates=True)
+        self._bot_started = True
         logger.info("Bot started")
     
     async def handle_chat_member(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2890,27 +3300,50 @@ class MessengerBot:
     
     async def stop(self):
         """Stop the bot."""
-        await self.application.updater.stop()
-        await self.application.stop()
-        await self.application.shutdown()
-        self.scheduler.shutdown()
+        if self._bot_started:
+            try:
+                if self.application.updater.running:
+                    await self.application.updater.stop()
+            except RuntimeError:
+                pass
+
+            try:
+                if self.application.running:
+                    await self.application.stop()
+            except RuntimeError:
+                pass
+
+            try:
+                await self.application.shutdown()
+            except RuntimeError:
+                pass
+
+        if self.scheduler.running:
+            self.scheduler.shutdown(wait=False)
         self.db.close()
         logger.info("Bot stopped")
 
 
 async def main():
     """Main entry point."""
+    from telegram.error import InvalidToken
+
     config = Config()
     if not config.validate():
         logger.error("Invalid configuration. Please check your .env file.")
-        return
-    
+        sys.exit(1)
+
     bot = MessengerBot(config)
-    
+
     try:
         await bot.start()
-        # Keep running
         await asyncio.Event().wait()
+    except InvalidToken:
+        logger.error(
+            "BOT_TOKEN was rejected by Telegram. "
+            "Use the exact token from @BotFather (format: 123456789:AAH...)."
+        )
+        sys.exit(1)
     except KeyboardInterrupt:
         logger.info("Shutting down...")
     finally:

@@ -271,3 +271,126 @@ class UserStorage:
             print(f"Error activating user: {e}")
             return False
 
+    def create_user_by_admin(
+        self,
+        user_id: int,
+        full_name: str,
+        active_until: datetime,
+        phone: Optional[str] = None,
+    ) -> bool:
+        """Create or update a user from the superadmin panel."""
+        try:
+            self.db.execute_query(
+                """
+                INSERT INTO users (id, full_name, phone, status, auth, active_until)
+                VALUES (%s, %s, %s, 1, 0, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    full_name = EXCLUDED.full_name,
+                    phone = EXCLUDED.phone,
+                    status = 1,
+                    active_until = EXCLUDED.active_until
+                """,
+                (user_id, full_name, phone, active_until),
+            )
+            return True
+        except Exception as e:
+            print(f"Error creating user by admin: {e}")
+            return False
+
+    def delete_user_completely(self, user_id: int) -> bool:
+        """Delete user and related data, mirroring Django admin delete."""
+        try:
+            conn = self.db.get_connection()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables
+                            WHERE table_name = 'groups'
+                        );
+                        """
+                    )
+                    if cur.fetchone()[0]:
+                        cur.execute("DELETE FROM groups WHERE user_id = %s", (user_id,))
+
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables
+                            WHERE table_name = 'messages'
+                        );
+                        """
+                    )
+                    if cur.fetchone()[0]:
+                        cur.execute("DELETE FROM messages WHERE user_id = %s", (user_id,))
+
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables
+                            WHERE table_name = 'scheduled_messages'
+                        );
+                        """
+                    )
+                    if cur.fetchone()[0]:
+                        cur.execute(
+                            """
+                            SELECT EXISTS (
+                                SELECT FROM information_schema.tables
+                                WHERE table_name = 'scheduled_message_groups'
+                            );
+                            """
+                        )
+                        if cur.fetchone()[0]:
+                            cur.execute(
+                                """
+                                DELETE FROM scheduled_message_groups
+                                WHERE scheduled_id IN (
+                                    SELECT id FROM scheduled_messages WHERE user_id = %s
+                                )
+                                """,
+                                (user_id,),
+                            )
+                        cur.execute(
+                            "DELETE FROM scheduled_messages WHERE user_id = %s",
+                            (user_id,),
+                        )
+
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables
+                            WHERE table_name = 'user_last_groups'
+                        );
+                        """
+                    )
+                    if cur.fetchone()[0]:
+                        cur.execute(
+                            "DELETE FROM user_last_groups WHERE user_id = %s",
+                            (user_id,),
+                        )
+
+                    cur.execute(
+                        """
+                        SELECT EXISTS (
+                            SELECT FROM information_schema.tables
+                            WHERE table_name = 'user_payments'
+                        );
+                        """
+                    )
+                    if cur.fetchone()[0]:
+                        cur.execute(
+                            "DELETE FROM user_payments WHERE user_id = %s",
+                            (user_id,),
+                        )
+
+                    cur.execute("DELETE FROM users WHERE id = %s", (user_id,))
+                conn.commit()
+                return True
+            finally:
+                self.db.put_connection(conn)
+        except Exception as e:
+            print(f"Error deleting user completely: {e}")
+            return False
+
