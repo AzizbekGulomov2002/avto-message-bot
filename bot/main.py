@@ -1021,13 +1021,14 @@ class MessengerBot:
             
             # Update .env file automatically
             env_updated = self._update_env_file(file_id)
+            display_name = document.file_name or "Noma'lum"
             
             if env_updated:
                 message = (
                     f"✅ Video fayl (document sifatida) qabul qilindi va .env fayli yangilandi!\n\n"
                     f"📹 File ID:\n<code>{file_id}</code>\n\n"
                     f"🆔 File Unique ID: {file_unique_id}\n"
-                    f"📄 Fayl nomi: {document.file_name or "Noma'lum"}\n"
+                    f"📄 Fayl nomi: {display_name}\n"
                     f"💾 Hajmi: {document.file_size} bytes\n\n"
                     f"✅ .env fayli avtomatik yangilandi!\n"
                     f"Endi 'Video qo'llanma' tugmasi ishlaydi."
@@ -1037,7 +1038,7 @@ class MessengerBot:
                     f"✅ Video fayl (document sifatida) qabul qilindi!\n\n"
                     f"📹 File ID:\n<code>{file_id}</code>\n\n"
                     f"🆔 File Unique ID: {file_unique_id}\n"
-                    f"📄 Fayl nomi: {document.file_name or "Noma'lum"}\n"
+                    f"📄 Fayl nomi: {display_name}\n"
                     f"💾 Hajmi: {document.file_size} bytes\n\n"
                     f"⚠️ .env faylini avtomatik yangilab bo'lmadi.\n"
                     f"Quyidagi file_id ni .env fayliga qo'shing:\n"
