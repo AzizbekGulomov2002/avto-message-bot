@@ -20,6 +20,8 @@ class UserState:
     admin_target_id: Optional[int] = None
     admin_pending_name: str = ""
     admin_pending_phone: Optional[str] = None
+    code_can_resend: bool = False
+    code_length: int = 5
 
 
 class UserStateManager:

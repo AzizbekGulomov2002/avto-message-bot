@@ -29,7 +29,15 @@ from telegram.ext import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telethon import TelegramClient
-from telethon.errors import SessionPasswordNeededError, PhoneCodeExpiredError, PhoneCodeInvalidError, AuthKeyUnregisteredError
+from telethon.errors import (
+    AuthKeyUnregisteredError,
+    FloodWaitError,
+    PhoneCodeExpiredError,
+    PhoneCodeInvalidError,
+    SendCodeUnavailableError,
+    SessionPasswordNeededError,
+)
+from telethon.tl.functions.auth import ResendCodeRequest
 
 from bot.config import Config
 from bot.storage.database import Database
@@ -897,6 +905,11 @@ class MessengerBot:
                     self.config.APP_ID,
                     self.config.APP_HASH,
                     receive_updates=False,
+                    device_model="Samsung SM-G991B",
+                    system_version="Android 13",
+                    app_version="10.14.5",
+                    lang_code="uz",
+                    system_lang_code="uz-UZ",
                 )
                 self.clients[user_id] = client
 
@@ -937,53 +950,146 @@ class MessengerBot:
                 session_path.unlink()
                 logger.info(f"[CLIENT] Removed stale session file: {session_path}")
 
-    def _code_request_prompt(self, code_length: int = 5) -> str:
-        """User-facing instructions after Telegram sends a login code."""
-        formatted_code_hint = " ".join(["X"] * code_length)
+    def _code_length_hint(self, code_length: int) -> str:
+        """Example format for login code entry."""
+        return " ".join(["X"] * code_length)
+
+    def _build_code_delivery_message(self, phone: str, sent_code) -> str:
+        """Explain where Telegram delivered the login code."""
+        code_type = sent_code.type
+        type_name = type(code_type).__name__
+        code_length = getattr(code_type, "length", None) or 5
+        code_hint = self._code_length_hint(code_length)
+
+        if "App" in type_name:
+            return (
+                "📝 Telegram login kodi yuborildi.\n\n"
+                "⚠️ Kod SMS emas — boshqa qurilmadagi Telegram ilovangizga keladi.\n"
+                "Telegram ilovasini oching → «Telegram» xizmati chatidagi kodni ko'ring.\n\n"
+                f"Kod {code_length} ta raqamdan iborat (masalan: {code_hint}).\n"
+                "Faqat oxirgi kelgan kodni shu botga yuboring."
+            )
+
+        if any(token in type_name for token in ("Sms", "Firebase", "Fragment")):
+            return (
+                "📝 Telegram login kodi SMS orqali yuborildi.\n\n"
+                f"{phone} raqamingizga kelgan {code_length} xonali kodni kiriting.\n"
+                f"Masalan: {code_hint}"
+            )
+
+        if any(token in type_name for token in ("Call", "Missed", "Flash")):
+            return (
+                "📞 Telegram qo'ng'iroq qiladi.\n\n"
+                "Qo'ng'iroq raqamining oxirgi raqamlari yoki ovozli xabar — sizning kodingiz.\n"
+                f"Kod {code_length} ta raqamdan iborat (masalan: {code_hint})."
+            )
+
         return (
             "📝 Telegram akkauntingizga yangi kod yuborildi.\n\n"
-            f"Faqat oxirgi kelgan kodni kiriting (masalan: {formatted_code_hint}).\n"
-            "Raqamlar orasini ochib kiriting"
+            f"Faqat oxirgi kelgan kodni kiriting (masalan: {code_hint}).\n"
+            "SMS kelmasa, boshqa qurilmadagi Telegram ilovasini ham tekshiring."
         )
 
-    async def _send_code_request(self, user_id: int, phone: str) -> bool:
+    def _can_resend_login_code(self, sent_code) -> bool:
+        """Whether user can request another delivery method."""
+        type_name = type(sent_code.type).__name__
+        if "App" in type_name:
+            return True
+        return sent_code.next_type is not None
+
+    def _build_code_request_keyboard(self) -> InlineKeyboardMarkup:
+        """Keyboard shown while waiting for login code."""
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("📨 SMS orqali qayta yuborish", callback_data="auth_resend_code")],
+        ])
+
+    def _store_sent_code_state(self, state: UserState, sent_code) -> int:
+        """Persist SentCode details in user state."""
+        state.phone_code_hash = sent_code.phone_code_hash
+        state.code_length = getattr(sent_code.type, "length", None) or 5
+        state.code_can_resend = self._can_resend_login_code(sent_code)
+        return state.code_length
+
+    async def _send_code_request(self, user_id: int, phone: str) -> Optional[str]:
         """Send code request to user's phone number."""
         try:
             await self._reset_telegram_session(user_id)
             logger.info(f"[CODE REQUEST] Sending code request to phone {phone} for user {user_id}")
             print(f"[CODE REQUEST] Sending code request to phone {phone} for user {user_id}")
-            
+
             client = await self._get_or_create_client(user_id)
             if not client.is_connected():
                 logger.info(f"[CODE REQUEST] Connecting Telegram client for user {user_id}")
                 print(f"[CODE REQUEST] Connecting Telegram client for user {user_id}")
                 await client.connect()
-            
-            # Send code request
+
             logger.info(f"[CODE REQUEST] Requesting code for phone {phone}")
             print(f"[CODE REQUEST] Requesting code for phone {phone}")
             result = await client.send_code_request(phone)
-            
-            logger.info(f"[CODE REQUEST] ✅ Code request sent successfully. Phone hash: {result.phone_code_hash[:10]}...")
-            print(f"[CODE REQUEST] ✅ Code request sent successfully. Phone hash: {result.phone_code_hash[:10]}...")
-            
-            # Store phone code hash for later use
+
+            delivery_type = type(result.type).__name__
             state = self.state_manager.get_state(user_id)
-            state.phone_code_hash = result.phone_code_hash
-            
-            # Format code display message (e.g., "7 3 4 6 8")
-            code_length = result.type.length if hasattr(result.type, 'length') else 5
-            formatted_code_hint = " ".join(["X"] * code_length)
-            logger.info(f"[CODE REQUEST] Code format hint: {formatted_code_hint} (length: {code_length})")
-            print(f"[CODE REQUEST] Code format hint: {formatted_code_hint} (length: {code_length})")
-            
-            return True
+            code_length = self._store_sent_code_state(state, result)
+
+            logger.info(
+                f"[CODE REQUEST] ✅ Code sent via {delivery_type}. "
+                f"Hash: {result.phone_code_hash[:10]}..., length: {code_length}"
+            )
+            print(
+                f"[CODE REQUEST] ✅ Code sent via {delivery_type}. "
+                f"Hash: {result.phone_code_hash[:10]}..., length: {code_length}"
+            )
+
+            return self._build_code_delivery_message(phone, result)
+        except FloodWaitError as e:
+            logger.error(f"[CODE REQUEST] Flood wait for user {user_id}: {e}")
+            return f"⏳ Juda ko'p urinish. {e.seconds} soniyadan keyin qayta urinib ko'ring."
         except Exception as e:
             logger.error(f"[CODE REQUEST] ❌ Error sending code request for user {user_id}: {e}", exc_info=True)
             print(f"[CODE REQUEST] ❌ Error sending code request for user {user_id}: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
+            return None
+
+    async def _resend_code_request(self, user_id: int, phone: str) -> Optional[str]:
+        """Resend login code, usually via SMS."""
+        state = self.state_manager.get_state(user_id)
+        if not state.phone_code_hash:
+            return None
+
+        try:
+            client = await self._get_or_create_client(user_id)
+            if not client.is_connected():
+                await client.connect()
+
+            logger.info(f"[CODE REQUEST] Resending code for phone {phone} (user {user_id})")
+            result = await client(ResendCodeRequest(
+                phone_number=phone,
+                phone_code_hash=state.phone_code_hash,
+            ))
+
+            delivery_type = type(result.type).__name__
+            self._store_sent_code_state(state, result)
+            logger.info(f"[CODE REQUEST] ✅ Code resent via {delivery_type} for user {user_id}")
+
+            prefix = "📨 Kod qayta yuborildi.\n\n"
+            return prefix + self._build_code_delivery_message(phone, result)
+        except SendCodeUnavailableError:
+            logger.warning(f"[CODE REQUEST] SMS resend unavailable for user {user_id}")
+            return (
+                "⚠️ SMS hozir yuborilmadi.\n\n"
+                "Telegram kodni faqat ilovaga yuborgan bo'lishi mumkin.\n"
+                "Boshqa qurilmadagi Telegram ilovasini oching → «Telegram» chatidagi kodni ko'ring."
+            )
+        except FloodWaitError as e:
+            return f"⏳ Juda ko'p urinish. {e.seconds} soniyadan keyin qayta urinib ko'ring."
+        except Exception as e:
+            logger.error(f"[CODE REQUEST] ❌ Resend failed for user {user_id}: {e}", exc_info=True)
+            return None
+
+    async def _reply_code_request_message(self, chat_id: int, user_id: int, phone: str, message: str):
+        """Send login-code instructions with optional resend button."""
+        state = self.state_manager.get_state(user_id)
+        reply_markup = self._build_code_request_keyboard() if state.code_can_resend else None
+        await self.application.bot.send_message(chat_id, message, reply_markup=reply_markup)
     
     async def _save_session_json(self, user_id: int, client: TelegramClient):
         """Save session information to JSON file."""
@@ -1193,13 +1299,10 @@ class MessengerBot:
         # Save phone number to database
         self.user_storage.update_user_phone(user_id, formatted_phone)
         # Send code request to user's phone
-        code_sent = await self._send_code_request(user_id, formatted_phone)
-        if code_sent:
+        code_message = await self._send_code_request(user_id, formatted_phone)
+        if code_message:
             state.step = "waiting_for_code"
-            await update.message.reply_text(
-                self._code_request_prompt(),
-                reply_markup=None
-            )
+            await self._reply_code_request_message(chat_id, user_id, formatted_phone, code_message)
         else:
             await update.message.reply_text("❌ Kod yuborishda xatolik yuz berdi. Qayta urinib ko'ring.")
     
@@ -1517,13 +1620,10 @@ class MessengerBot:
             # Save phone number to database
             self.user_storage.update_user_phone(user_id, formatted_phone)
             # Send code request to user's phone
-            code_sent = await self._send_code_request(user_id, formatted_phone)
-            if code_sent:
+            code_message = await self._send_code_request(user_id, formatted_phone)
+            if code_message:
                 state.step = "waiting_for_code"
-                await update.message.reply_text(
-                    self._code_request_prompt(),
-                    reply_markup=None
-                )
+                await self._reply_code_request_message(chat_id, user_id, formatted_phone, code_message)
             else:
                 await update.message.reply_text("❌ Kod yuborishda xatolik yuz berdi. Qayta urinib ko'ring.")
             return
@@ -1564,12 +1664,14 @@ class MessengerBot:
                     await update.message.reply_text(self._awaiting_activation_message())
                     await self._maybe_request_activation_review(user_id)
             elif result == "code_expired":
-                code_sent = await self._send_code_request(user_id, state.phone)
-                if code_sent:
+                code_message = await self._send_code_request(user_id, state.phone)
+                if code_message:
                     state.step = "waiting_for_code"
-                    await update.message.reply_text(
-                        "⏰ Kod eskirib qolgan yoki allaqachon ishlatilgan.\n\n"
-                        f"{self._code_request_prompt()}"
+                    await self._reply_code_request_message(
+                        chat_id,
+                        user_id,
+                        state.phone,
+                        f"⏰ Kod eskirib qolgan yoki allaqachon ishlatilgan.\n\n{code_message}",
                     )
                 else:
                     keyboard = [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]]
@@ -1581,12 +1683,15 @@ class MessengerBot:
                     state.step = "waiting_for_phone"
                     state.phone_code_hash = None
             elif result == "code_shared":
-                code_sent = await self._send_code_request(user_id, state.phone)
-                if code_sent:
+                code_message = await self._send_code_request(user_id, state.phone)
+                if code_message:
                     state.step = "waiting_for_code"
-                    await update.message.reply_text(
+                    await self._reply_code_request_message(
+                        chat_id,
+                        user_id,
+                        state.phone,
                         "🔒 Telegram bu kodni xavfsizlik sababli rad etdi, chunki u allaqachon boshqa joyda ishlatilgan.\n\n"
-                        f"{self._code_request_prompt()}"
+                        f"{code_message}",
                     )
                 else:
                     await update.message.reply_text(
@@ -1728,6 +1833,25 @@ class MessengerBot:
             "admin_add_", "admin_delete_", "admin_menu", "admin_cancel_add", "admin_ignore"
         )):
             await self._handle_admin_panel_callback(query, data)
+            return
+
+        if data == "auth_resend_code":
+            state = self.state_manager.get_state(user_id)
+            if not state.phone:
+                await query.answer("Avval telefon raqam yuboring.", show_alert=True)
+                return
+
+            code_message = await self._resend_code_request(user_id, state.phone)
+            if not code_message:
+                await query.answer(
+                    "Kodni qayta yuborib bo'lmadi. Telegram ilovasidagi kodni tekshiring.",
+                    show_alert=True,
+                )
+                return
+
+            state.step = "waiting_for_code"
+            reply_markup = self._build_code_request_keyboard() if state.code_can_resend else None
+            await query.edit_message_text(code_message, reply_markup=reply_markup)
             return
         
         # Main menu actions
