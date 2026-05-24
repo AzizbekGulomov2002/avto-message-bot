@@ -23,6 +23,31 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-change-this-in-prod
 DEBUG = os.getenv('DJANGO_DEBUG', 'False').lower() in ('true', '1', 'yes')
 
 DEFAULT_SITE_DOMAIN = 'message.system24.app'
+DEFAULT_DJANGO_PORT = '8000'
+
+
+def _discover_server_ip_addresses():
+    """Return non-loopback IPv4 addresses for the current host."""
+    import socket
+
+    addresses = set()
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(('8.8.8.8', 80))
+            addresses.add(sock.getsockname()[0])
+    except OSError:
+        pass
+
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip and not ip.startswith('127.'):
+                addresses.add(ip)
+    except OSError:
+        pass
+
+    return sorted(addresses)
+
 
 allowed_hosts = os.getenv('DJANGO_ALLOWED_HOSTS', 'localhost,127.0.0.1')
 ALLOWED_HOSTS = [host.strip() for host in allowed_hosts.split(',') if host.strip()]
@@ -50,6 +75,17 @@ for origin in CSRF_TRUSTED_ORIGINS:
     hostname = urlparse(origin).hostname
     if hostname and hostname not in ALLOWED_HOSTS:
         ALLOWED_HOSTS.append(hostname)
+
+auto_allow_server_ip = os.getenv('DJANGO_AUTO_ALLOW_SERVER_IP', 'True').lower() in ('true', '1', 'yes')
+django_port = os.getenv('DJANGO_PORT', DEFAULT_DJANGO_PORT).strip() or DEFAULT_DJANGO_PORT
+
+if auto_allow_server_ip:
+    for ip in _discover_server_ip_addresses():
+        if ip not in ALLOWED_HOSTS:
+            ALLOWED_HOSTS.append(ip)
+        for origin in (f'http://{ip}', f'http://{ip}:{django_port}'):
+            if origin not in CSRF_TRUSTED_ORIGINS:
+                CSRF_TRUSTED_ORIGINS.append(origin)
 
 if not ALLOWED_HOSTS:
     ALLOWED_HOSTS = ['*']

@@ -9,6 +9,8 @@ User=root
 Group=root
 WorkingDirectory=/home/avto-message-bot
 EnvironmentFile=/home/avto-message-bot/.env
+Environment=PYTHONPATH=/home/avto-message-bot/src
+ExecStartPre=/home/avto-message-bot/env/bin/python /home/avto-message-bot/src/config/manage.py migrate --noinput
 ExecStart=/home/avto-message-bot/env/bin/python -m bot.main
 Restart=always
 RestartSec=5

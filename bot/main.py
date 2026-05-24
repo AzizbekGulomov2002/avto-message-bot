@@ -245,8 +245,26 @@ class MessengerBot:
                         print("✅ Created user_last_groups table")
 
                     cur.execute("""
+                        CREATE TABLE IF NOT EXISTS users (
+                            id BIGINT NOT NULL PRIMARY KEY,
+                            auth INTEGER DEFAULT 0,
+                            status INTEGER DEFAULT 0,
+                            full_name VARCHAR(200),
+                            phone VARCHAR(20),
+                            active_until TIMESTAMPTZ
+                        );
+                    """)
+
+                    cur.execute("""
                         DO $$
                         BEGIN
+                            IF NOT EXISTS (
+                                SELECT 1 FROM information_schema.columns
+                                WHERE table_name = 'users' AND column_name = 'phone'
+                            ) THEN
+                                ALTER TABLE users ADD COLUMN phone VARCHAR(20);
+                            END IF;
+
                             IF NOT EXISTS (
                                 SELECT 1 FROM information_schema.columns
                                 WHERE table_name = 'users' AND column_name = 'is_superuser'
