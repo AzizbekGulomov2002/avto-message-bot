@@ -30,11 +30,18 @@ class UsersConfig(AppConfig):
                 instance._was_superuser = False
 
         def handle_user_saved(sender, instance, **kwargs):
-            clear_superuser_cache()
-            was_superuser = getattr(instance, '_was_superuser', False)
-            if instance.is_superuser and not was_superuser:
-                notify_superuser_assigned(instance.id)
-                notify_pending_activation_requests_for_superuser(instance.id)
+            try:
+                clear_superuser_cache()
+                was_superuser = getattr(instance, '_was_superuser', False)
+                if instance.is_superuser and not was_superuser:
+                    notify_superuser_assigned(instance.id)
+                    notify_pending_activation_requests_for_superuser(instance.id)
+            except Exception:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "Failed post-save superuser handling for user %s",
+                    instance.id,
+                )
 
         pre_save.connect(
             cache_previous_superuser,

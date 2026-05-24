@@ -1,5 +1,5 @@
 """User models for Django admin."""
-from django.db import models
+from django.db import models, connection
 from django.contrib import admin
 from django.contrib.admin import SimpleListFilter
 from django import forms
@@ -19,6 +19,42 @@ class User(models.Model):
     class Meta:
         db_table = 'users'
         managed = False  # Use existing table
+
+    def save(self, *args, **kwargs):
+        """Persist to the unmanaged users table with explicit SQL."""
+        from users.superusers import ensure_users_superuser_column
+
+        ensure_users_superuser_column()
+        with connection.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO users (
+                    id, auth, status, full_name, phone, active_until, is_superuser
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                    auth = EXCLUDED.auth,
+                    status = EXCLUDED.status,
+                    full_name = EXCLUDED.full_name,
+                    phone = EXCLUDED.phone,
+                    active_until = EXCLUDED.active_until,
+                    is_superuser = EXCLUDED.is_superuser
+                """,
+                [
+                    self.id,
+                    self.auth,
+                    self.status,
+                    self.full_name,
+                    self.phone,
+                    self.active_until,
+                    self.is_superuser,
+                ],
+            )
+    
+    def delete(self, *args, **kwargs):
+        """Delete from the unmanaged users table."""
+        with connection.cursor() as cursor:
+            cursor.execute("DELETE FROM users WHERE id = %s", [self.id])
     
     def __str__(self):
         return f"{self.id} - {self.full_name or 'No name'}"
@@ -172,11 +208,16 @@ class UserAdmin(admin.ModelAdmin):
     list_filter = (IsSuperuserFilter, IsActiveFilter, IsAuthenticatedFilter)
     search_fields = ('id', 'full_name', 'phone')
     readonly_fields = (
-        'id',
         'get_status_display',
         'get_auth_display',
         'get_active_until_display',
     )
+
+    def get_readonly_fields(self, request, obj=None):
+        """Allow entering Telegram ID when creating a user."""
+        if obj is None:
+            return self.readonly_fields
+        return ('id', *self.readonly_fields)
     
     fieldsets = (
         ('Basic Information', {
@@ -221,15 +262,21 @@ class UserAdmin(admin.ModelAdmin):
         
         # Send notification if status changed
         if old_status is not None and old_status != obj.status:
-            from .signals import send_telegram_message
-            if old_status == 0 and obj.status == 1:
-                # Status changed from inactive to active
-                message = "✅ Akkauntingiz aktiv qilindi, ishlatishingiz mumkin"
-                send_telegram_message(obj.id, message, show_menu=True)
-            elif old_status == 1 and obj.status == 0:
-                # Status changed from active to inactive
-                message = "❌ Sizning akkauntingiz no faol bo'ldi, admin bilan bog'laning: @system24admin"
-                send_telegram_message(obj.id, message)
+            try:
+                from .signals import send_telegram_message
+                if old_status == 0 and obj.status == 1:
+                    message = "✅ Akkauntingiz aktiv qilindi, ishlatishingiz mumkin"
+                    send_telegram_message(obj.id, message, show_menu=True)
+                elif old_status == 1 and obj.status == 0:
+                    message = "❌ Sizning akkauntingiz no faol bo'ldi, admin bilan bog'laning: @system24admin"
+                    send_telegram_message(obj.id, message)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).exception(
+                    "Failed to notify user %s about status change: %s",
+                    obj.id,
+                    exc,
+                )
     
     def delete_model(self, request, obj):
         """Override delete to handle foreign key constraints and delete session."""
