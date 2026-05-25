@@ -31,11 +31,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telethon import TelegramClient
 from telethon.errors import (
     AuthKeyUnregisteredError,
+    ChatForbiddenError,
+    ChatWriteForbiddenError,
     FloodWaitError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     SendCodeUnavailableError,
     SessionPasswordNeededError,
+    UserBannedInChannelError,
 )
 from telethon.tl.functions.auth import ResendCodeRequest
 
@@ -2898,15 +2901,7 @@ class MessengerBot:
             await client.send_message(group_id, message_text)
             logger.info(f"[GROUP SEND] Sent message to group {group_id} for user {user_id}")
 
-            if scheduled_id is not None:
-                self.db.execute_query(
-                    """
-                    UPDATE scheduled_message_groups
-                    SET last_sent_at = %s
-                    WHERE scheduled_id = %s AND group_id = %s
-                    """,
-                    (datetime.now(TASHKENT_TZ), scheduled_id, group_id),
-                )
+            self._mark_scheduled_group_attempted(scheduled_id, group_id)
             return True
         except AuthKeyUnregisteredError:
             logger.warning(f"[GROUP SEND] Session expired for user {user_id} while sending to group {group_id}")
@@ -2920,6 +2915,13 @@ class MessengerBot:
                         pass
                     del self.clients[user_id]
             return False
+        except (ChatForbiddenError, ChatWriteForbiddenError, UserBannedInChannelError) as e:
+            logger.error(
+                f"[GROUP SEND] Permission denied for group {group_id} and user {user_id}; "
+                f"skipping this scheduled cycle: {e}"
+            )
+            self._mark_scheduled_group_attempted(scheduled_id, group_id)
+            return False
         except Exception as e:
             logger.error(f"[GROUP SEND] Error sending to group {group_id} for user {user_id}: {e}")
             return False
@@ -2927,6 +2929,31 @@ class MessengerBot:
             if cycle_key is not None:
                 with self.group_send_lock:
                     self.active_group_cycles.discard(cycle_key)
+
+    def _mark_scheduled_group_attempted(
+        self,
+        scheduled_id: Optional[int],
+        group_id: int,
+        attempted_at: Optional[datetime] = None,
+    ):
+        """Record a scheduled group attempt so permanent failures do not retry every check."""
+        if scheduled_id is None:
+            return
+
+        try:
+            self.db.execute_query(
+                """
+                UPDATE scheduled_message_groups
+                SET last_sent_at = %s
+                WHERE scheduled_id = %s AND group_id = %s
+                """,
+                (attempted_at or datetime.now(TASHKENT_TZ), scheduled_id, group_id),
+            )
+        except Exception as e:
+            logger.error(
+                f"[GROUP SEND] Failed to update attempt time for scheduled message "
+                f"{scheduled_id}, group {group_id}: {e}"
+            )
 
     async def _send_group_after_delay(
         self,
