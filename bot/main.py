@@ -48,6 +48,7 @@ from bot.storage.user_storage import UserStorage
 from bot.storage.scheduled_storage import ScheduledStorage
 from bot.handlers.user_state import UserState, UserStateManager
 from bot.handlers.group_handler import fetch_user_groups, get_group_name
+from bot.phone import PHONE_FORMAT_ERROR, normalize_phone
 
 # Configure logging
 logging.basicConfig(
@@ -1215,7 +1216,8 @@ class MessengerBot:
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
             await update.message.reply_text(
                 "👋 Xush kelibsiz!\n\n"
-                "📱 Avval Telegram akkauntingizga kirish uchun telefon raqamingizni yuboring yoki kiriting (masalan: +998901234567):",
+                "📱 Avval Telegram akkauntingizga kirish uchun telefon raqamingizni yuboring yoki kiriting "
+                "(xalqaro format: +998901234567, +79001234567):",
                 reply_markup=reply_markup
             )
             return
@@ -1272,32 +1274,10 @@ class MessengerBot:
             )
             return
         
-        # Get phone number from contact
-        phone = contact.phone_number
-        
-        # Ensure phone starts with + (Telegram usually provides it)
-        if not phone.startswith('+'):
-            phone = '+' + phone
-        
-        # Validate phone number format: +998 followed by 9 digits (total 12 digits after +998)
-        if not phone.startswith('+998'):
-            await update.message.reply_text(
-                "❌ Telefon raqam noto'g'ri formatda.\n\n"
-                "Iltimos, +998 bilan boshlanadigan 12 xonali raqam kiriting (masalan: +998901234567):"
-            )
+        formatted_phone = normalize_phone(contact.phone_number)
+        if not formatted_phone:
+            await update.message.reply_text(PHONE_FORMAT_ERROR)
             return
-        
-        # Remove +998 and check if remaining is 9 digits
-        remaining = phone[4:].replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
-        if not remaining.isdigit() or len(remaining) != 9:
-            await update.message.reply_text(
-                "❌ Telefon raqam noto'g'ri formatda.\n\n"
-                "Iltimos, +998 bilan boshlanadigan 12 xonali raqam kiriting (masalan: +998901234567):"
-            )
-            return
-        
-        # Format phone number properly: +998 + 9 digits
-        formatted_phone = f"+998{remaining}"
         state.phone = formatted_phone
         # Save phone number to database
         self.user_storage.update_user_phone(user_id, formatted_phone)
@@ -1502,7 +1482,7 @@ class MessengerBot:
             state.admin_pending_name = full_name
             state.step = "admin_waiting_phone"
             await update.message.reply_text(
-                "📱 Telefon raqamni kiriting (+998901234567)\n"
+                "📱 Telefon raqamni xalqaro formatda kiriting (masalan: +998901234567, +79001234567)\n"
                 "O'tkazib yuborish uchun - yuboring:"
             )
             return
@@ -1516,19 +1496,13 @@ class MessengerBot:
             if phone_input == "-":
                 state.admin_pending_phone = None
             else:
-                phone = phone_input
-                if not phone.startswith("+998"):
+                formatted_phone = normalize_phone(phone_input)
+                if not formatted_phone:
                     await update.message.reply_text(
-                        "❌ Telefon raqam +998 bilan boshlanishi kerak yoki - yuboring:"
+                        f"{PHONE_FORMAT_ERROR}\n\nYoki - yuboring."
                     )
                     return
-                remaining = phone[4:].replace(" ", "").replace("-", "")
-                if not remaining.isdigit() or len(remaining) != 9:
-                    await update.message.reply_text(
-                        "❌ Telefon raqam noto'g'ri. Masalan: +998901234567 yoki - yuboring:"
-                    )
-                    return
-                state.admin_pending_phone = f"+998{remaining}"
+                state.admin_pending_phone = formatted_phone
 
             target_id = state.admin_target_id
             if not target_id:
@@ -1599,26 +1573,10 @@ class MessengerBot:
         
         # Handle authentication flow
         if state.step == "waiting_for_phone":
-            # Validate phone number format: +998 followed by 9 digits (total 12 digits after +998)
-            phone = text.strip()
-            if not phone.startswith('+998'):
-                await update.message.reply_text(
-                    "❌ Telefon raqam noto'g'ri formatda.\n\n"
-                    "Iltimos, +998 bilan boshlanadigan 12 xonali raqam kiriting (masalan: +998901234567):"
-                )
+            formatted_phone = normalize_phone(text)
+            if not formatted_phone:
+                await update.message.reply_text(PHONE_FORMAT_ERROR)
                 return
-            
-            # Remove +998 and check if remaining is 9 digits
-            remaining = phone[4:].replace(' ', '').replace('-', '').replace('(', '').replace(')', '')
-            if not remaining.isdigit() or len(remaining) != 9:
-                await update.message.reply_text(
-                    "❌ Telefon raqam noto'g'ri formatda.\n\n"
-                    "Iltimos, +998 bilan boshlanadigan 12 xonali raqam kiriting (masalan: +998901234567):"
-                )
-                return
-            
-            # Format phone number properly: +998 + 9 digits
-            formatted_phone = f"+998{remaining}"
             state.phone = formatted_phone
             # Save phone number to database
             self.user_storage.update_user_phone(user_id, formatted_phone)
@@ -1805,7 +1763,8 @@ class MessengerBot:
                 reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
                 await update.message.reply_text(
                     "👋 Xush kelibsiz!\n\n"
-                    "📱 Avval Telegram akkauntingizga kirish uchun telefon raqamingizni yuboring yoki kiriting (masalan: +998901234567):",
+                    "📱 Avval Telegram akkauntingizga kirish uchun telefon raqamingizni yuboring yoki kiriting "
+                "(xalqaro format: +998901234567, +79001234567):",
                     reply_markup=reply_markup
                 )
                 return
