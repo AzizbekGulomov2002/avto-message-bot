@@ -31,15 +31,20 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telethon import TelegramClient
 from telethon.errors import (
     AuthKeyUnregisteredError,
+    ChannelPrivateError,
     ChatForbiddenError,
+    ChatInvalidError,
     ChatWriteForbiddenError,
     FloodWaitError,
+    PeerFloodError,
+    PeerIdInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
     SendCodeUnavailableError,
     SessionPasswordNeededError,
     UserBannedInChannelError,
 )
+from telethon.errors.rpcbaseerrors import ForbiddenError
 from telethon.tl.functions.auth import ResendCodeRequest
 
 from bot.config import Config
@@ -62,6 +67,8 @@ logger = logging.getLogger(__name__)
 TASHKENT_TZ = pytz.timezone('Asia/Tashkent')
 GROUP_STAGGER_SECONDS = 5
 SCHEDULED_CHECK_SECONDS = 15
+GROUP_SEND_TIMEOUT_SECONDS = 45
+MAX_CONCURRENT_GROUP_SENDS = 10
 
 
 class MessengerBot:
@@ -80,12 +87,15 @@ class MessengerBot:
         self.last_sent_times: Dict[int, datetime] = {}  # Track last sent time for each scheduled message
         self.last_sent_lock = threading.Lock()
         self.group_send_lock = threading.Lock()
+        self.group_send_semaphore: Optional[asyncio.Semaphore] = None
         self.active_group_cycles: Set[tuple[int, int, int]] = set()
+        self._pending_group_tasks: Set[asyncio.Task] = set()
         self.send_batches: Dict[str, Dict] = {}
         self.schedule_notified_ids: Set[int] = set()
         self.schedule_final_outcomes: Dict[int, Dict] = {}
         self.activation_request_sent: Set[int] = set()
         self._bot_started = False
+        self._schedule_tick_count = 0
         self.scheduler.start()
         
         # Validate APP_ID and APP_HASH
@@ -124,7 +134,10 @@ class MessengerBot:
             self._send_scheduled_messages,
             'interval',
             seconds=SCHEDULED_CHECK_SECONDS,
-            id='send_scheduled_messages'
+            id='send_scheduled_messages',
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30,
         )
     
     def _ensure_tables_exist(self):
@@ -2644,19 +2657,69 @@ class MessengerBot:
                 pass
             await self.application.bot.send_message(chat_id, "⚠️ Guruhlarni yuklashda xatolik yuz berdi.")
 
-    def _create_send_batch(self, user_id: int, total_groups: int, notify_on_complete: bool) -> str:
-        """Track a staggered group send batch for completion notification."""
-        batch_id = str(uuid.uuid4())
-        with self.group_send_lock:
-            self.send_batches[batch_id] = {
-                'user_id': user_id,
-                'total': total_groups,
-                'done': 0,
-                'success': 0,
-                'failed': 0,
-                'notify': notify_on_complete,
-            }
-        return batch_id
+    def _ensure_group_send_semaphore(self):
+        """Lazy-init semaphore once the asyncio event loop is running."""
+        if self.group_send_semaphore is None:
+            self.group_send_semaphore = asyncio.Semaphore(MAX_CONCURRENT_GROUP_SENDS)
+
+    def _spawn_background_task(self, coro) -> asyncio.Task:
+        """Track background tasks and log unexpected failures."""
+        self._ensure_group_send_semaphore()
+        task = asyncio.create_task(coro)
+        self._pending_group_tasks.add(task)
+
+        def _done_callback(done_task: asyncio.Task):
+            self._pending_group_tasks.discard(done_task)
+            if done_task.cancelled():
+                return
+            exc = done_task.exception()
+            if exc:
+                logger.error(f"[TASK] Background task failed: {exc}", exc_info=exc)
+
+        task.add_done_callback(_done_callback)
+        return task
+
+    def _is_permanent_send_error(self, error: Exception) -> bool:
+        """Return True when retrying the same cycle is pointless."""
+        if isinstance(
+            error,
+            (
+                ChatForbiddenError,
+                ChatWriteForbiddenError,
+                UserBannedInChannelError,
+                PeerIdInvalidError,
+                ChannelPrivateError,
+                ChatInvalidError,
+                ForbiddenError,
+            ),
+        ):
+            return True
+
+        message = str(error).upper()
+        permanent_markers = (
+            'INVALID PEER',
+            'CHAT_SEND_PLAIN_FORBIDDEN',
+            'CHAT_WRITE_FORBIDDEN',
+            'USER_BANNED',
+            'CHANNEL_PRIVATE',
+        )
+        return any(marker in message for marker in permanent_markers)
+
+    def _skip_scheduled_cycle_on_failure(
+        self,
+        scheduled_id: Optional[int],
+        group_id: int,
+        error: Exception,
+    ):
+        """Always skip the current scheduled cycle after a failed send attempt."""
+        if scheduled_id is None:
+            return
+        self._mark_scheduled_group_attempted(scheduled_id, group_id)
+        if self._is_permanent_send_error(error):
+            logger.info(
+                f"[GROUP SEND] Marked permanent failure for scheduled {scheduled_id}, "
+                f"group {group_id}: {error}"
+            )
 
     def _ensure_tz(self, value: datetime) -> datetime:
         if value.tzinfo is None:
@@ -2848,21 +2911,52 @@ class MessengerBot:
                     return False
                 self.active_group_cycles.add(cycle_key)
 
+        self._ensure_group_send_semaphore()
         try:
-            client = await self._get_or_create_client(user_id)
-            if not client:
-                logger.warning(f"[GROUP SEND] No client for user {user_id}")
-                return False
+            async with self.group_send_semaphore:
+                client = await self._get_or_create_client(user_id)
+                if not client:
+                    error = RuntimeError(f"No Telegram client available for user {user_id}")
+                    logger.warning(f"[GROUP SEND] {error}")
+                    self._skip_scheduled_cycle_on_failure(scheduled_id, group_id, error)
+                    return False
 
-            if not client.is_connected():
-                await client.connect()
+                if not client.is_connected():
+                    await asyncio.wait_for(
+                        client.connect(),
+                        timeout=GROUP_SEND_TIMEOUT_SECONDS,
+                    )
 
-            await client.send_message(group_id, message_text)
+                await asyncio.wait_for(
+                    client.send_message(group_id, message_text),
+                    timeout=GROUP_SEND_TIMEOUT_SECONDS,
+                )
             logger.info(f"[GROUP SEND] Sent message to group {group_id} for user {user_id}")
 
             self._mark_scheduled_group_attempted(scheduled_id, group_id)
             return True
-        except AuthKeyUnregisteredError:
+        except asyncio.TimeoutError:
+            error = TimeoutError(
+                f"Timed out after {GROUP_SEND_TIMEOUT_SECONDS}s while sending to group {group_id}"
+            )
+            logger.error(f"[GROUP SEND] {error} for user {user_id}")
+            self._skip_scheduled_cycle_on_failure(scheduled_id, group_id, error)
+            return False
+        except FloodWaitError as e:
+            logger.warning(
+                f"[GROUP SEND] FloodWait {e.seconds}s for user {user_id}, group {group_id}; "
+                f"skipping this cycle"
+            )
+            self._skip_scheduled_cycle_on_failure(scheduled_id, group_id, e)
+            return False
+        except PeerFloodError as e:
+            logger.error(
+                f"[GROUP SEND] Peer flood for user {user_id}, group {group_id}; "
+                f"skipping this cycle: {e}"
+            )
+            self._skip_scheduled_cycle_on_failure(scheduled_id, group_id, e)
+            return False
+        except AuthKeyUnregisteredError as e:
             logger.warning(f"[GROUP SEND] Session expired for user {user_id} while sending to group {group_id}")
             with self.clients_lock:
                 if user_id in self.clients:
@@ -2873,21 +2967,44 @@ class MessengerBot:
                     except Exception:
                         pass
                     del self.clients[user_id]
+            self._skip_scheduled_cycle_on_failure(scheduled_id, group_id, e)
             return False
         except (ChatForbiddenError, ChatWriteForbiddenError, UserBannedInChannelError) as e:
             logger.error(
                 f"[GROUP SEND] Permission denied for group {group_id} and user {user_id}; "
                 f"skipping this scheduled cycle: {e}"
             )
-            self._mark_scheduled_group_attempted(scheduled_id, group_id)
+            self._skip_scheduled_cycle_on_failure(scheduled_id, group_id, e)
+            return False
+        except (PeerIdInvalidError, ChannelPrivateError, ChatInvalidError, ForbiddenError) as e:
+            logger.error(
+                f"[GROUP SEND] Unreachable group {group_id} for user {user_id}; "
+                f"skipping this scheduled cycle: {e}"
+            )
+            self._skip_scheduled_cycle_on_failure(scheduled_id, group_id, e)
             return False
         except Exception as e:
             logger.error(f"[GROUP SEND] Error sending to group {group_id} for user {user_id}: {e}")
+            self._skip_scheduled_cycle_on_failure(scheduled_id, group_id, e)
             return False
         finally:
             if cycle_key is not None:
                 with self.group_send_lock:
                     self.active_group_cycles.discard(cycle_key)
+
+    def _create_send_batch(self, user_id: int, total_groups: int, notify_on_complete: bool) -> str:
+        """Track a staggered group send batch for completion notification."""
+        batch_id = str(uuid.uuid4())
+        with self.group_send_lock:
+            self.send_batches[batch_id] = {
+                'user_id': user_id,
+                'total': total_groups,
+                'done': 0,
+                'success': 0,
+                'failed': 0,
+                'notify': notify_on_complete,
+            }
+        return batch_id
 
     def _mark_scheduled_group_attempted(
         self,
@@ -2963,7 +3080,7 @@ class MessengerBot:
 
         batch_id = self._create_send_batch(user_id, len(group_offsets), notify_on_complete)
         for group_id, offset_seconds in group_offsets:
-            asyncio.create_task(
+            self._spawn_background_task(
                 self._send_group_after_delay(
                     user_id,
                     group_id,
@@ -3232,6 +3349,15 @@ class MessengerBot:
     async def _send_scheduled_messages(self):
         """Send scheduled messages per group on its own interval without blocking others."""
         try:
+            self._schedule_tick_count += 1
+            if self._schedule_tick_count % 20 == 0:
+                pending_tasks = len(self._pending_group_tasks)
+                active_cycles = len(self.active_group_cycles)
+                logger.info(
+                    f"[SCHEDULED] Heartbeat tick={self._schedule_tick_count}, "
+                    f"pending_tasks={pending_tasks}, active_cycles={active_cycles}"
+                )
+
             now = datetime.now(TASHKENT_TZ)
             
             query = """
@@ -3314,7 +3440,7 @@ class MessengerBot:
                         with self.group_send_lock:
                             if cycle_key in self.active_group_cycles:
                                 continue
-                        asyncio.create_task(
+                        self._spawn_background_task(
                             self._send_group_after_delay(
                                 user_id,
                                 group_id,
