@@ -230,6 +230,34 @@ class UserStorage:
         except Exception as e:
             print(f"Error resetting auth status: {e}")
             return False
+
+    def pause_user_scheduled_messages(self, user_id: int) -> int:
+        """Pause all scheduled messages for a user."""
+        try:
+            return self.db.execute_query(
+                "UPDATE scheduled_messages SET paused = TRUE WHERE user_id = %s AND paused = FALSE",
+                (user_id,),
+            )
+        except Exception as e:
+            print(f"Error pausing scheduled messages for user {user_id}: {e}")
+            return 0
+
+    def unpause_user_scheduled_messages(self, user_id: int) -> int:
+        """Resume scheduled messages after the user re-authenticates."""
+        try:
+            return self.db.execute_query(
+                """
+                UPDATE scheduled_messages
+                SET paused = FALSE
+                WHERE user_id = %s
+                  AND paused = TRUE
+                  AND (expires_at IS NULL OR expires_at > NOW())
+                """,
+                (user_id,),
+            )
+        except Exception as e:
+            print(f"Error unpausing scheduled messages for user {user_id}: {e}")
+            return 0
     
     def set_user_auth(self, user_id: int, auth: int) -> bool:
         """Set user authentication status."""

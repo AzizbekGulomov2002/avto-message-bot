@@ -69,6 +69,11 @@ GROUP_STAGGER_SECONDS = 5
 SCHEDULED_CHECK_SECONDS = 15
 GROUP_SEND_TIMEOUT_SECONDS = 45
 MAX_CONCURRENT_GROUP_SENDS = 10
+HANDLER_TIMEOUT_SECONDS = 90
+CLIENT_CHECK_TIMEOUT_SECONDS = 20
+
+SESSION_REASON_EXPIRED = "session_expired"
+SESSION_REASON_LEFT_BOT = "user_left_bot"
 
 
 class MessengerBot:
@@ -94,6 +99,8 @@ class MessengerBot:
         self.schedule_notified_ids: Set[int] = set()
         self.schedule_final_outcomes: Dict[int, Dict] = {}
         self.activation_request_sent: Set[int] = set()
+        self._invalidated_sessions: Set[int] = set()
+        self._session_invalidation_lock = asyncio.Lock()
         self._bot_started = False
         self._schedule_tick_count = 0
         self.scheduler.start()
@@ -493,6 +500,158 @@ class MessengerBot:
             return
         await self._notify_superusers_about_activation_request(user_id)
 
+    def _session_reason_label(self, reason: str) -> str:
+        labels = {
+            SESSION_REASON_EXPIRED: "Telegram sessiyasi muddati tugadi",
+            SESSION_REASON_LEFT_BOT: "Foydalanuvchi botdan chiqib ketdi",
+        }
+        return labels.get(reason, reason)
+
+    def _format_user_profile(self, user) -> str:
+        return (
+            f"Ism: {user.full_name or '—'}\n"
+            f"ID: {user.id}\n"
+            f"Telefon: {user.phone or '—'}"
+        )
+
+    async def _notify_superusers_session_event(self, user_id: int, reason: str):
+        """Notify superusers when a user session becomes invalid."""
+        user = self.user_storage.get_user(user_id)
+        if not user:
+            return
+
+        reason_label = self._session_reason_label(reason)
+        text = (
+            f"⚠️ {reason_label}\n\n"
+            f"{self._format_user_profile(user)}\n\n"
+            "Foydalanuvchi qayta ro'yxatdan o'tishi kerak."
+        )
+
+        superusers = self.user_storage.get_superuser_ids()
+        if not superusers:
+            logger.warning(f"No superusers configured for session event of user {user_id}")
+            return
+
+        for superuser_id in superusers:
+            if superuser_id == user_id:
+                continue
+            try:
+                await self.application.bot.send_message(superuser_id, text)
+            except Exception as e:
+                logger.error(
+                    f"Failed to notify superuser {superuser_id} about session event for user {user_id}: {e}"
+                )
+
+    async def _prompt_user_reregistration(self, user_id: int, reason: str):
+        """Ask the user to authenticate again."""
+        reason_label = self._session_reason_label(reason)
+        keyboard = [[KeyboardButton("📱 Telefon raqamni yuborish", request_contact=True)]]
+        reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
+        text = (
+            f"⚠️ {reason_label}.\n\n"
+            "Botdan foydalanish uchun Telegram akkauntingizga qayta kiring.\n"
+            "Telefon raqamingizni yuboring yoki kiriting "
+            "(xalqaro format: +998901234567, +79001234567):"
+        )
+        try:
+            await self.application.bot.send_message(user_id, text, reply_markup=reply_markup)
+        except Exception as e:
+            logger.warning(f"Could not prompt user {user_id} to re-register: {e}")
+
+    async def _invalidate_user_session(self, user_id: int, reason: str):
+        """Log the user out, pause scheduled sends, and notify user/admin once."""
+        async with self._session_invalidation_lock:
+            if user_id in self._invalidated_sessions:
+                return
+
+            user = self.user_storage.get_user(user_id)
+            if not user or user.auth != 1:
+                return
+
+            self._invalidated_sessions.add(user_id)
+
+        logger.warning(f"[SESSION] Invalidating session for user {user_id}: {reason}")
+
+        with self.clients_lock:
+            client = self.clients.pop(user_id, None)
+        if client:
+            try:
+                if client.is_connected():
+                    await client.disconnect()
+            except Exception:
+                pass
+
+        self._delete_user_session(user_id)
+        self.user_storage.reset_auth_status(user_id)
+        paused_count = self.user_storage.pause_user_scheduled_messages(user_id)
+        if paused_count:
+            logger.info(f"[SESSION] Paused {paused_count} scheduled messages for user {user_id}")
+
+        state = self.state_manager.get_state(user_id)
+        state.step = "waiting_for_phone"
+        state.pending_message = ""
+        state.selected_groups = {}
+        state.selected_interval_id = None
+        state.selected_duration_id = None
+        state.phone = None
+        state.phone_code_hash = None
+
+        await self._prompt_user_reregistration(user_id, reason)
+        await self._notify_superusers_session_event(user_id, reason)
+
+    def _user_can_use_bot(self, user_id: int) -> bool:
+        """Return whether the user may access bot features."""
+        if self._is_superuser(user_id):
+            return True
+
+        user = self.user_storage.get_user(user_id)
+        return bool(user and user.auth == 1 and user.status == 1)
+
+    async def _send_access_denied_message(self, update: Update, user_id: int):
+        """Tell the user why bot features are unavailable."""
+        user = self.user_storage.get_user(user_id)
+        if not user or user.auth != 1:
+            state = self.state_manager.get_state(user_id)
+            if state.step != "waiting_for_phone":
+                state.step = "waiting_for_phone"
+                await self._prompt_user_reregistration(
+                    user_id,
+                    SESSION_REASON_EXPIRED,
+                )
+            return
+
+        if user.status != 1:
+            text = self._awaiting_activation_message()
+            if update.callback_query:
+                await update.callback_query.message.reply_text(text)
+            elif update.effective_message:
+                await update.effective_message.reply_text(text)
+
+    async def _reply_handler_error(self, update: Optional[Update], text: str):
+        """Best-effort error response so handlers never fail silently."""
+        if not update:
+            return
+
+        try:
+            if update.callback_query:
+                await update.callback_query.answer(text, show_alert=True)
+            elif update.effective_message:
+                await update.effective_message.reply_text(text)
+        except Exception as e:
+            logger.warning(f"[HANDLER] Failed to send handler error response: {e}")
+
+    async def _global_error_handler(self, update: object, context: ContextTypes.DEFAULT_TYPE):
+        """Catch unhandled handler exceptions and keep the bot responsive."""
+        logger.error(
+            f"[HANDLER] Unhandled exception: {context.error}",
+            exc_info=context.error,
+        )
+        if isinstance(update, Update):
+            await self._reply_handler_error(
+                update,
+                "⚠️ Xatolik yuz berdi. Qayta urinib ko'ring.",
+            )
+
     async def _activate_user_access(self, target_user_id: int, active_until: datetime, admin_chat_id: int):
         """Activate user until selected date and notify both sides."""
         active_until = active_until.astimezone(TASHKENT_TZ)
@@ -837,12 +996,53 @@ class MessengerBot:
         """Show a loading sticker while a handler is processing."""
         @wraps(handler)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-            chat_id = update.effective_chat.id
-            loading_message = await self._send_loading_indicator(chat_id)
+            chat_id = update.effective_chat.id if update.effective_chat else None
+            loading_message = None
+            if chat_id is not None:
+                loading_message = await self._send_loading_indicator(chat_id)
             try:
-                return await handler(update, context)
+                return await asyncio.wait_for(
+                    handler(update, context),
+                    timeout=HANDLER_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"[HANDLER] Timeout in {handler.__name__}")
+                await self._reply_handler_error(
+                    update,
+                    "⏳ So'rov juda uzoq davom etdi. Qayta urinib ko'ring.",
+                )
+            except Exception as e:
+                logger.error(f"[HANDLER] Error in {handler.__name__}: {e}", exc_info=True)
+                await self._reply_handler_error(
+                    update,
+                    "⚠️ Xatolik yuz berdi. Qayta urinib ko'ring.",
+                )
             finally:
                 await self._clear_loading_indicator(loading_message)
+
+        return wrapper
+
+    def _with_handler_protection(self, handler):
+        """Protect handlers with timeout and error responses."""
+        @wraps(handler)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            try:
+                return await asyncio.wait_for(
+                    handler(update, context),
+                    timeout=HANDLER_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"[HANDLER] Timeout in {handler.__name__}")
+                await self._reply_handler_error(
+                    update,
+                    "⏳ So'rov juda uzoq davom etdi. Qayta urinib ko'ring.",
+                )
+            except Exception as e:
+                logger.error(f"[HANDLER] Error in {handler.__name__}: {e}", exc_info=True)
+                await self._reply_handler_error(
+                    update,
+                    "⚠️ Xatolik yuz berdi. Qayta urinib ko'ring.",
+                )
 
         return wrapper
 
@@ -873,6 +1073,7 @@ class MessengerBot:
 
     def _register_handlers(self):
         """Register bot handlers."""
+        self.application.add_error_handler(self._global_error_handler)
         self.application.add_handler(CommandHandler("start", self._with_loading_sticker(self.handle_start)))
         self.application.add_handler(CommandHandler("admin", self._with_loading_sticker(self.handle_admin)))
         self.application.add_handler(CallbackQueryHandler(self._with_loading_sticker(self.handle_callback)))
@@ -882,7 +1083,12 @@ class MessengerBot:
         self.application.add_handler(MessageHandler(filters.VIDEO, self.handle_video_message))
         self.application.add_handler(MessageHandler(filters.Document.VIDEO, self.handle_video_document))
         # Handle text messages (but not commands)
-        self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
+        self.application.add_handler(
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                self._with_handler_protection(self.handle_message),
+            )
+        )
         # Handle user leaving/blocking the bot
         self.application.add_handler(ChatMemberHandler(self.handle_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
     
@@ -937,19 +1143,48 @@ class MessengerBot:
                     logger.info(f"[CLIENT] ✅ Telegram client created successfully for user {user_id}")
                     print(f"[CLIENT] ✅ Telegram client created successfully for user {user_id}")
 
+        user = self.user_storage.get_user(user_id)
+        should_validate_session = bool(user and user.auth == 1)
+
         try:
             if not client.is_connected():
-                await client.connect()
+                await asyncio.wait_for(
+                    client.connect(),
+                    timeout=CLIENT_CHECK_TIMEOUT_SECONDS,
+                )
 
-            try:
-                await client.get_me()
-            except (AuthKeyUnregisteredError, Exception):
-                logger.warning(f"[CLIENT] Session check failed for user {user_id}, but keeping session file")
+            if should_validate_session:
+                try:
+                    me = await asyncio.wait_for(
+                        client.get_me(),
+                        timeout=CLIENT_CHECK_TIMEOUT_SECONDS,
+                    )
+                    if me is None:
+                        await self._invalidate_user_session(user_id, SESSION_REASON_EXPIRED)
+                        return None
+                except AuthKeyUnregisteredError:
+                    await self._invalidate_user_session(user_id, SESSION_REASON_EXPIRED)
+                    return None
+                except Exception as e:
+                    logger.warning(f"[CLIENT] Session check failed for user {user_id}: {e}")
+        except asyncio.TimeoutError:
+            logger.warning(f"[CLIENT] Timed out checking client for user {user_id}")
         except Exception as e:
             logger.warning(f"[CLIENT] Error checking client for user {user_id}: {e}")
 
         return client
     
+    def _complete_user_authentication(self, user_id: int):
+        """Persist successful login and restore paused scheduled work."""
+        self.user_storage.update_auth_status(user_id)
+        self._invalidated_sessions.discard(user_id)
+
+        user = self.user_storage.get_user(user_id)
+        if user and user.status == 1:
+            unpaused = self.user_storage.unpause_user_scheduled_messages(user_id)
+            if unpaused:
+                logger.info(f"[AUTH] Resumed {unpaused} scheduled messages for user {user_id}")
+
     async def _reset_telegram_session(self, user_id: int):
         """Remove stale Telethon session before a fresh login attempt."""
         client = self.clients.pop(user_id, None)
@@ -1616,8 +1851,7 @@ class MessengerBot:
             # Authenticate user
             result = await self._authenticate_user(user_id, state.phone, cleaned_code, state.phone_code_hash, chat_id)
             if result == "success":
-                # Update auth status to 1
-                self.user_storage.update_auth_status(user_id)
+                self._complete_user_authentication(user_id)
                 
                 # Check if user needs to provide full name
                 user = self.user_storage.get_user(user_id)
@@ -1698,8 +1932,7 @@ class MessengerBot:
             # Handle password authentication
             success = await self._authenticate_user_password(user_id, state.password)
             if success:
-                # Update auth status to 1
-                self.user_storage.update_auth_status(user_id)
+                self._complete_user_authentication(user_id)
                 state.password = None  # Clear password from state
                 
                 # Check if user needs to provide full name
@@ -1759,6 +1992,10 @@ class MessengerBot:
                 await self._maybe_request_activation_review(user_id)
             return
         if state.step == "waiting_for_message":
+            if not self._user_can_use_bot(user_id):
+                state.step = ""
+                await self._send_access_denied_message(update, user_id)
+                return
             state.pending_message = text
             state.step = ""
             await self._show_group_selection(chat_id, user_id)
@@ -1827,6 +2064,10 @@ class MessengerBot:
             state.step = "waiting_for_code"
             reply_markup = self._build_code_request_keyboard() if state.code_can_resend else None
             await query.edit_message_text(code_message, reply_markup=reply_markup)
+            return
+
+        if not self._user_can_use_bot(user_id):
+            await self._send_access_denied_message(update, user_id)
             return
         
         # Main menu actions
@@ -2522,46 +2763,17 @@ class MessengerBot:
             try:
                 groups = await fetch_user_groups(client, user_id)
             except AuthKeyUnregisteredError:
-                # Session expired - try to reconnect and restore session
-                logger.warning(f"[GROUPS] Session expired for user {user_id}, attempting to restore...")
                 try:
-                    await loading_msg.delete()
-                except:
+                    if loading_msg:
+                        await loading_msg.delete()
+                except Exception:
                     pass
-                
-                # Try to restore session by reconnecting
-                try:
-                    with self.clients_lock:
-                        self.clients.pop(user_id, None)
-                    client = await self._get_or_create_client(user_id)
-                    if client:
-                        try:
-                            await client.connect()
-                            # Verify session is still valid
-                            me = await client.get_me()
-                            if me:
-                                logger.info(f"[GROUPS] ✅ Session restored for user {user_id}")
-                                # Retry fetching groups
-                                groups = await fetch_user_groups(client, user_id)
-                                # Continue with group selection if successful
-                            else:
-                                raise AuthKeyUnregisteredError("Session invalid")
-                        except Exception as restore_error:
-                            logger.error(f"[GROUPS] Failed to restore session for user {user_id}: {restore_error}")
-                            # Session cannot be restored, but don't delete it
-                            # User can manually re-authenticate if needed
-                            await self.application.bot.send_message(
-                                chat_id,
-                                "⚠️ Session bilan muammo bor. Iltimos, qayta urinib ko'ring yoki /start buyrug'ini yuboring."
-                            )
-                            return
-                except Exception as e:
-                    logger.error(f"[GROUPS] Error during session restore for user {user_id}: {e}")
-                    await self.application.bot.send_message(
-                        chat_id,
-                        "⚠️ Session bilan muammo bor. Iltimos, qayta urinib ko'ring."
-                    )
-                    return
+                await self._invalidate_user_session(user_id, SESSION_REASON_EXPIRED)
+                await self.application.bot.send_message(
+                    chat_id,
+                    "⚠️ Telegram sessiyangiz tugadi. Qayta ro'yxatdan o'ting.",
+                )
+                return
             
             if not groups:
                 try:
@@ -2958,16 +3170,8 @@ class MessengerBot:
             return False
         except AuthKeyUnregisteredError as e:
             logger.warning(f"[GROUP SEND] Session expired for user {user_id} while sending to group {group_id}")
-            with self.clients_lock:
-                if user_id in self.clients:
-                    client = self.clients[user_id]
-                    try:
-                        if client.is_connected():
-                            await client.disconnect()
-                    except Exception:
-                        pass
-                    del self.clients[user_id]
             self._skip_scheduled_cycle_on_failure(scheduled_id, group_id, e)
+            await self._invalidate_user_session(user_id, SESSION_REASON_EXPIRED)
             return False
         except (ChatForbiddenError, ChatWriteForbiddenError, UserBannedInChannelError) as e:
             logger.error(
@@ -3346,6 +3550,19 @@ class MessengerBot:
             logger.error(f"[PAYMENTS] Error checking expired payments: {e}", exc_info=True)
             print(f"[PAYMENTS] Error checking expired payments: {e}")
     
+    async def _run_db_query(self, query: str, params=None, fetch_one: bool = False, fetch_all: bool = False):
+        """Run blocking database work off the asyncio event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self.db.execute_query(
+                query,
+                params,
+                fetch_one=fetch_one,
+                fetch_all=fetch_all,
+            ),
+        )
+
     async def _send_scheduled_messages(self):
         """Send scheduled messages per group on its own interval without blocking others."""
         try:
@@ -3377,7 +3594,7 @@ class MessengerBot:
                   )
             """
             
-            messages = self.db.execute_query(query, (now,), fetch_all=True)
+            messages = await self._run_db_query(query, (now,), fetch_all=True)
             
             if not messages:
                 return
@@ -3410,7 +3627,7 @@ class MessengerBot:
                         WHERE scheduled_id = %s
                         ORDER BY send_offset_seconds, group_id
                     """
-                    groups = self.db.execute_query(groups_query, (scheduled_id,), fetch_all=True)
+                    groups = await self._run_db_query(groups_query, (scheduled_id,), fetch_all=True)
                     
                     if not groups:
                         continue
@@ -3481,12 +3698,14 @@ class MessengerBot:
             new_status = chat_member.new_chat_member.status
             
             # Check if user left or blocked the bot
-            # NOTE: We do NOT delete session here - sessions are only deleted when admin removes user from admin panel
-            # This ensures sessions persist even if user temporarily leaves/returns
             if new_status in ['left', 'kicked']:
-                logger.info(f"[CHAT MEMBER] User {user_id} left or blocked the bot. Session will be preserved.")
-                print(f"[CHAT MEMBER] User {user_id} left or blocked the bot. Session will be preserved.")
-                # Just disconnect client from memory, but keep session files
+                user = self.user_storage.get_user(user_id)
+                if user and user.auth == 1:
+                    logger.info(f"[CHAT MEMBER] User {user_id} left or blocked the bot. Invalidating session.")
+                    await self._invalidate_user_session(user_id, SESSION_REASON_LEFT_BOT)
+                    return
+
+                logger.info(f"[CHAT MEMBER] User {user_id} left or blocked the bot before authentication.")
                 with self.clients_lock:
                     client = self.clients.pop(user_id, None)
                 if client:
@@ -3495,7 +3714,6 @@ class MessengerBot:
                             await client.disconnect()
                     except Exception:
                         pass
-                    logger.info(f"[CHAT MEMBER] Client removed from memory for user {user_id}, but session files preserved")
         except Exception as e:
             logger.error(f"Error handling chat member update: {e}", exc_info=True)
     
