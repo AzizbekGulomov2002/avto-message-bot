@@ -49,7 +49,11 @@ from telethon.tl.functions.auth import ResendCodeRequest
 
 from bot.config import Config
 from bot.digitalocean import DigitalOceanAPIError, fetch_billing_summary, format_billing_message
-from bot.storage.database import Database
+from bot.do_payment_reminder import (
+    format_payment_reminder_message,
+    mark_reminder_sent,
+    should_send_payment_reminder,
+)
 from bot.storage.user_storage import UserStorage
 from bot.storage.scheduled_storage import ScheduledStorage
 from bot.handlers.user_state import UserState, UserStateManager
@@ -146,6 +150,16 @@ class MessengerBot:
             max_instances=1,
             coalesce=True,
             misfire_grace_time=30,
+        )
+
+        self.scheduler.add_job(
+            self._check_do_payment_reminder,
+            'cron',
+            hour=9,
+            minute=0,
+            id='check_do_payment_reminder',
+            max_instances=1,
+            coalesce=True,
         )
     
     def _ensure_tables_exist(self):
@@ -1530,7 +1544,7 @@ class MessengerBot:
                 fetch_billing_summary,
                 self.config.DO_TOKEN,
             )
-            await update.message.reply_text(format_billing_message(summary))
+            await update.message.reply_text(format_billing_message(summary), parse_mode="HTML")
         except DigitalOceanAPIError as e:
             logger.error(f"[MONEY] DigitalOcean API error for user {user_id}: {e}")
             await update.message.reply_text(f"⚠️ DigitalOcean ma'lumotini olishda xatolik:\n{e}")
@@ -3530,6 +3544,51 @@ class MessengerBot:
                         pass  # Ignore errors when notifying
         except Exception as e:
             logger.error(f"Error checking expired users: {e}")
+
+    async def _check_do_payment_reminder(self):
+        """Notify superadmins when DigitalOcean payment is within 3 days."""
+        if not self.config.DO_TOKEN:
+            return
+
+        should_send, days_left, next_payment = should_send_payment_reminder()
+        if not should_send or days_left is None or next_payment is None:
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+            summary = await loop.run_in_executor(
+                None,
+                fetch_billing_summary,
+                self.config.DO_TOKEN,
+            )
+        except DigitalOceanAPIError as error:
+            logger.error(f"[DO REMINDER] DigitalOcean API error: {error}")
+            return
+        except Exception as error:
+            logger.error(f"[DO REMINDER] Unexpected error: {error}", exc_info=True)
+            return
+
+        message = format_payment_reminder_message(summary, days_left)
+        superusers = self.user_storage.get_superuser_ids()
+        if not superusers:
+            logger.warning("[DO REMINDER] No superusers configured")
+            return
+
+        sent_any = False
+        for superuser_id in superusers:
+            try:
+                await self.application.bot.send_message(
+                    superuser_id,
+                    message,
+                    parse_mode="HTML",
+                )
+                sent_any = True
+            except Exception as error:
+                logger.error(f"[DO REMINDER] Failed to notify superuser {superuser_id}: {error}")
+
+        if sent_any:
+            mark_reminder_sent(next_payment, datetime.now(TASHKENT_TZ))
+            logger.info(f"[DO REMINDER] Sent payment reminder ({days_left} days left)")
     
     async def _check_expired_payments(self):
         """Check expired payments and deactivate users, send notifications."""

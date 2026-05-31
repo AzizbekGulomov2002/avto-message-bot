@@ -41,12 +41,17 @@ def _format_usd(value: Optional[str]) -> str:
     return f"${amount:,.2f}"
 
 
-def _next_invoice_date(now: Optional[datetime] = None) -> datetime:
+def next_invoice_date(now: Optional[datetime] = None) -> datetime:
     """DigitalOcean invoices are issued on the 1st of each month."""
     now = now or datetime.now(TASHKENT_TZ)
     if now.month == 12:
         return now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
     return now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def days_until_next_payment(next_payment: datetime, now: Optional[datetime] = None) -> int:
+    now = now or datetime.now(TASHKENT_TZ)
+    return (next_payment.date() - now.date()).days
 
 
 def _parse_generated_at(value: Optional[str]) -> Optional[datetime]:
@@ -60,44 +65,55 @@ def _parse_generated_at(value: Optional[str]) -> Optional[datetime]:
 
 
 def fetch_billing_summary(token: str) -> dict[str, Any]:
-    """Fetch balance and invoice preview from DigitalOcean."""
+    """Fetch balance from DigitalOcean."""
     balance = _do_get(token, "/customers/my/balance")
-    invoices = _do_get(token, "/customers/my/invoices?per_page=1")
 
     generated_at = _parse_generated_at(balance.get("generated_at"))
-    invoice_preview = invoices.get("invoice_preview") or {}
-    next_payment_at = _next_invoice_date(generated_at or datetime.now(TASHKENT_TZ))
+    reference_time = generated_at or datetime.now(TASHKENT_TZ)
+    next_payment_at = next_invoice_date(reference_time)
 
     return {
-        "account_balance": balance.get("account_balance"),
         "month_to_date_balance": balance.get("month_to_date_balance"),
-        "month_to_date_usage": balance.get("month_to_date_usage"),
         "generated_at": generated_at,
-        "invoice_preview_amount": invoice_preview.get("amount"),
-        "invoice_period": invoice_preview.get("invoice_period"),
         "next_payment_at": next_payment_at,
     }
 
 
-def format_billing_message(summary: dict[str, Any]) -> str:
+def _format_days_left_text(days_left: int, html: bool = True) -> str:
+    if days_left == 0:
+        text = "Bugun"
+    else:
+        text = f"{days_left} kun"
+    if html:
+        return f"<b>{text}</b>"
+    return text
+
+
+def format_billing_message(summary: dict[str, Any], html: bool = True) -> str:
     """Format billing data for Telegram."""
     generated_at = summary.get("generated_at")
     generated_text = generated_at.strftime("%Y-%m-%d %H:%M") if generated_at else "—"
     next_payment_at = summary.get("next_payment_at")
     next_payment_text = next_payment_at.strftime("%Y-%m-%d") if next_payment_at else "—"
-    invoice_period = summary.get("invoice_period") or "—"
+    balance_text = _format_usd(summary.get("month_to_date_balance"))
+
+    if html:
+        balance_text = f"<b>{balance_text}</b>"
+        next_payment_text = f"<b>{next_payment_text}</b>"
 
     lines = [
         "💰 DigitalOcean balansi",
         "",
-        f"Hisob balansi: {_format_usd(summary.get('account_balance'))}",
-        f"Shu oy sarfi: {_format_usd(summary.get('month_to_date_usage'))}",
-        f"Joriy jami balans: {_format_usd(summary.get('month_to_date_balance'))}",
-        "",
+        f"Hozirgi jami balans: {balance_text}",
         f"Keyingi to'lov sanasi: {next_payment_text}",
-        f"Invoice preview: {_format_usd(summary.get('invoice_preview_amount'))}",
-        f"Invoice davri: {invoice_period}",
+    ]
+
+    if next_payment_at:
+        days_left = days_until_next_payment(next_payment_at, datetime.now(TASHKENT_TZ))
+        lines.append(f"Qoldi: {_format_days_left_text(days_left, html=html)}")
+
+    lines.extend([
         "",
         f"Yangilangan: {generated_text} (Toshkent)",
-    ]
+    ])
     return "\n".join(lines)
