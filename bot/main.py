@@ -54,6 +54,7 @@ from bot.do_payment_reminder import (
     mark_reminder_sent,
     should_send_payment_reminder,
 )
+from bot.storage.database import Database
 from bot.storage.user_storage import UserStorage
 from bot.storage.scheduled_storage import ScheduledStorage
 from bot.handlers.user_state import UserState, UserStateManager
