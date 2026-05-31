@@ -53,6 +53,9 @@ class Config:
     VIDEO_TUTORIAL_FILE_ID: str = (os.getenv("VIDEO_TUTORIAL_FILE_ID", "") or "").strip()
     LOADING_STICKER_FILE_ID: str = (os.getenv("LOADING_STICKER_FILE_ID", "") or "").strip()
     
+    # DigitalOcean billing (superadmin /money command)
+    DO_TOKEN: str = (os.getenv("DO_TOKEN", "") or "").strip()
+
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "debug")
     

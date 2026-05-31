@@ -48,6 +48,7 @@ from telethon.errors.rpcbaseerrors import ForbiddenError
 from telethon.tl.functions.auth import ResendCodeRequest
 
 from bot.config import Config
+from bot.digitalocean import DigitalOceanAPIError, fetch_billing_summary, format_billing_message
 from bot.storage.database import Database
 from bot.storage.user_storage import UserStorage
 from bot.storage.scheduled_storage import ScheduledStorage
@@ -1076,6 +1077,7 @@ class MessengerBot:
         self.application.add_error_handler(self._global_error_handler)
         self.application.add_handler(CommandHandler("start", self._with_loading_sticker(self.handle_start)))
         self.application.add_handler(CommandHandler("admin", self._with_loading_sticker(self.handle_admin)))
+        self.application.add_handler(CommandHandler("money", self._with_loading_sticker(self.handle_money)))
         self.application.add_handler(CallbackQueryHandler(self._with_loading_sticker(self.handle_callback)))
         # Handle contact messages (phone number sharing)
         self.application.add_handler(MessageHandler(filters.CONTACT, self._with_loading_sticker(self.handle_contact)))
@@ -1503,6 +1505,38 @@ class MessengerBot:
             return
         
         await update.message.reply_text("admin bilan bog'lanish: @system24admin")
+
+    async def handle_money(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Show DigitalOcean balance for superadmins only."""
+        user_id = update.effective_user.id
+        chat_id = update.effective_chat.id
+
+        if not self._is_superuser(user_id):
+            await update.message.reply_text("❌ Bu buyruq faqat superadminlar uchun.")
+            return
+
+        if not self.config.DO_TOKEN:
+            await update.message.reply_text(
+                "⚠️ DO_TOKEN .env faylida sozlanmagan.\n"
+                "Serverdagi .env ga qo'shing:\n"
+                "DO_TOKEN=your_digitalocean_token"
+            )
+            return
+
+        try:
+            loop = asyncio.get_running_loop()
+            summary = await loop.run_in_executor(
+                None,
+                fetch_billing_summary,
+                self.config.DO_TOKEN,
+            )
+            await update.message.reply_text(format_billing_message(summary))
+        except DigitalOceanAPIError as e:
+            logger.error(f"[MONEY] DigitalOcean API error for user {user_id}: {e}")
+            await update.message.reply_text(f"⚠️ DigitalOcean ma'lumotini olishda xatolik:\n{e}")
+        except Exception as e:
+            logger.error(f"[MONEY] Unexpected error for user {user_id}: {e}", exc_info=True)
+            await update.message.reply_text("⚠️ Balansni olishda xatolik yuz berdi.")
     
     async def handle_contact(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle contact (phone number) sharing."""
