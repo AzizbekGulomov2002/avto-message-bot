@@ -2,6 +2,7 @@
 Description=Avto Message Bot Telegram service
 After=network.target postgresql.service
 Wants=postgresql.service
+OnFailure=avto-message-bot-alert.service
 
 [Service]
 Type=simple
@@ -14,7 +15,6 @@ ExecStartPre=/home/avto-message-bot/env/bin/python /home/avto-message-bot/src/co
 ExecStart=/home/avto-message-bot/env/bin/python -m bot.main
 Restart=always
 RestartSec=5
-OnFailure=avto-message-bot-alert.service
 
 [Install]
 WantedBy=multi-user.target
