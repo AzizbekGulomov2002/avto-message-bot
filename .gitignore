@@ -65,4 +65,5 @@ sessions/
 venv/
 .env/
 .DS_Store
-
+bot/data/
+logs/

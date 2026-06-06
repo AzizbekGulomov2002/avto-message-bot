@@ -1,0 +1,11 @@
+[Unit]
+Description=Watchdog for avto-message-bot heartbeat
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/home/avto-message-bot
+EnvironmentFile=/home/avto-message-bot/.env
+ExecStart=/home/avto-message-bot/env/bin/python /home/avto-message-bot/scripts/bot_watchdog.py

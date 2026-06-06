@@ -14,6 +14,7 @@ ExecStartPre=/home/avto-message-bot/env/bin/python /home/avto-message-bot/src/co
 ExecStart=/home/avto-message-bot/env/bin/python -m bot.main
 Restart=always
 RestartSec=5
+OnFailure=avto-message-bot-alert.service
 
 [Install]
 WantedBy=multi-user.target

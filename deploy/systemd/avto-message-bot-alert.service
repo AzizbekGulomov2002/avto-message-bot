@@ -1,0 +1,11 @@
+[Unit]
+Description=Alert superadmins when avto-message-bot crashes
+After=network.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/home/avto-message-bot
+EnvironmentFile=/home/avto-message-bot/.env
+ExecStart=/home/avto-message-bot/env/bin/python /home/avto-message-bot/scripts/bot_crash_alert.py
