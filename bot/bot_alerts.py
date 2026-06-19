@@ -84,6 +84,21 @@ def is_service_active(service_name: str = SYSTEMD_SERVICE_NAME) -> bool:
         return False
 
 
+def restart_service(service_name: str = SYSTEMD_SERVICE_NAME) -> bool:
+    """Osilib qolgan botni avtomatik qayta ishga tushirish."""
+    try:
+        result = subprocess.run(
+            ["systemctl", "restart", service_name],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def load_watchdog_state() -> dict[str, Any]:
     _ensure_data_dir()
     if not WATCHDOG_STATE_FILE.exists():

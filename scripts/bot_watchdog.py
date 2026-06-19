@@ -29,9 +29,13 @@ from bot.bot_alerts import (
     load_watchdog_state,
     notify_superadmins,
     read_runtime_heartbeat,
+    restart_service,
     save_watchdog_state,
 )
 from bot.config import Config
+
+# Avtomatik restartlar orasidagi minimal interval (restart-loop oldini olish).
+RESTART_COOLDOWN_SECONDS = 300
 
 
 def main() -> int:
@@ -57,6 +61,28 @@ def main() -> int:
             print(f"Down alert sent to {sent} superadmin(s): {reason}")
         else:
             print(f"Bot still unhealthy, alert already sent: {reason}")
+
+        # O'z-o'zini davolash: osilib qolgan botni avtomatik restart qilamiz,
+        # lekin cooldown ichida takror restart qilmaymiz (restart-loop himoyasi).
+        last_restart_at = state.get("last_auto_restart_at")
+        can_restart = True
+        if last_restart_at:
+            try:
+                elapsed = (
+                    datetime.now(TASHKENT_TZ)
+                    - datetime.fromisoformat(last_restart_at)
+                ).total_seconds()
+                can_restart = elapsed >= RESTART_COOLDOWN_SECONDS
+            except ValueError:
+                can_restart = True
+
+        if can_restart:
+            restarted = restart_service()
+            state["last_auto_restart_at"] = now
+            save_watchdog_state(state)
+            print(f"Auto-restart {'succeeded' if restarted else 'FAILED'}: {reason}")
+        else:
+            print("Auto-restart skipped (within cooldown window).")
         return 0
 
     if state.get("down_alert_sent"):
