@@ -28,6 +28,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+from telegram.request import HTTPXRequest
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telethon import TelegramClient
 from telethon.errors import (
@@ -81,6 +82,7 @@ MAX_GROUP_SEND_QUEUE_SIZE = 400
 MAX_SPAWNS_PER_SCHEDULE_TICK = 60
 HANDLER_TIMEOUT_SECONDS = 90
 CLIENT_CHECK_TIMEOUT_SECONDS = 20
+AUTH_OP_TIMEOUT_SECONDS = 30
 
 SESSION_REASON_EXPIRED = "session_expired"
 SESSION_REASON_LEFT_BOT = "user_left_bot"
@@ -124,13 +126,33 @@ class MessengerBot:
         self._session_invalidation_lock = asyncio.Lock()
         self._bot_started = False
         self._schedule_tick_count = 0
+        self._last_processed_update_id = 0
         self.scheduler.start()
         
         # Validate APP_ID and APP_HASH
         self._validate_telegram_credentials()
         
-        # Initialize bot application
-        self.application = Application.builder().token(config.BOT_TOKEN).build()
+        request = HTTPXRequest(
+            connection_pool_size=256,
+            connect_timeout=10.0,
+            read_timeout=30.0,
+            write_timeout=30.0,
+            pool_timeout=20.0,
+        )
+        get_updates_request = HTTPXRequest(
+            connection_pool_size=16,
+            connect_timeout=10.0,
+            read_timeout=40.0,
+            pool_timeout=20.0,
+        )
+        self.application = (
+            Application.builder()
+            .token(config.BOT_TOKEN)
+            .concurrent_updates(True)
+            .request(request)
+            .get_updates_request(get_updates_request)
+            .build()
+        )
         
         # Register handlers
         self._register_handlers()
@@ -1036,10 +1058,18 @@ class MessengerBot:
             )
             return
     
+    def _mark_update_processed(self, update: Update):
+        if update and update.update_id:
+            self._last_processed_update_id = max(
+                self._last_processed_update_id,
+                update.update_id,
+            )
+
     def _with_loading_sticker(self, handler):
         """Show a loading sticker while a handler is processing."""
         @wraps(handler)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            self._mark_update_processed(update)
             chat_id = update.effective_chat.id if update.effective_chat else None
             loading_message = None
             if chat_id is not None:
@@ -1070,6 +1100,7 @@ class MessengerBot:
         """Protect handlers with timeout and error responses."""
         @wraps(handler)
         async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            self._mark_update_processed(update)
             try:
                 return await asyncio.wait_for(
                     handler(update, context),
@@ -1125,8 +1156,12 @@ class MessengerBot:
         # Handle contact messages (phone number sharing)
         self.application.add_handler(MessageHandler(filters.CONTACT, self._with_loading_sticker(self.handle_contact)))
         # Handle video messages (for getting file_id)
-        self.application.add_handler(MessageHandler(filters.VIDEO, self.handle_video_message))
-        self.application.add_handler(MessageHandler(filters.Document.VIDEO, self.handle_video_document))
+        self.application.add_handler(
+            MessageHandler(filters.VIDEO, self._with_handler_protection(self.handle_video_message))
+        )
+        self.application.add_handler(
+            MessageHandler(filters.Document.VIDEO, self._with_handler_protection(self.handle_video_document))
+        )
         # Handle text messages (but not commands)
         self.application.add_handler(
             MessageHandler(
@@ -1135,7 +1170,12 @@ class MessengerBot:
             )
         )
         # Handle user leaving/blocking the bot
-        self.application.add_handler(ChatMemberHandler(self.handle_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+        self.application.add_handler(
+            ChatMemberHandler(
+                self._with_handler_protection(self.handle_chat_member),
+                ChatMemberHandler.MY_CHAT_MEMBER,
+            )
+        )
     
     async def _get_or_create_client(self, user_id: int) -> Optional[TelegramClient]:
         """Get or create Telegram client for user. Sessions are preserved and restored automatically."""
@@ -1318,11 +1358,14 @@ class MessengerBot:
             if not client.is_connected():
                 logger.info(f"[CODE REQUEST] Connecting Telegram client for user {user_id}")
                 print(f"[CODE REQUEST] Connecting Telegram client for user {user_id}")
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=CLIENT_CHECK_TIMEOUT_SECONDS)
 
             logger.info(f"[CODE REQUEST] Requesting code for phone {phone}")
             print(f"[CODE REQUEST] Requesting code for phone {phone}")
-            result = await client.send_code_request(phone)
+            result = await asyncio.wait_for(
+                client.send_code_request(phone),
+                timeout=AUTH_OP_TIMEOUT_SECONDS,
+            )
 
             delivery_type = type(result.type).__name__
             state = self.state_manager.get_state(user_id)
@@ -1355,13 +1398,16 @@ class MessengerBot:
         try:
             client = await self._get_or_create_client(user_id)
             if not client.is_connected():
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=CLIENT_CHECK_TIMEOUT_SECONDS)
 
             logger.info(f"[CODE REQUEST] Resending code for phone {phone} (user {user_id})")
-            result = await client(ResendCodeRequest(
-                phone_number=phone,
-                phone_code_hash=state.phone_code_hash,
-            ))
+            result = await asyncio.wait_for(
+                client(ResendCodeRequest(
+                    phone_number=phone,
+                    phone_code_hash=state.phone_code_hash,
+                )),
+                timeout=AUTH_OP_TIMEOUT_SECONDS,
+            )
 
             delivery_type = type(result.type).__name__
             self._store_sent_code_state(state, result)
@@ -1397,10 +1443,10 @@ class MessengerBot:
             
             # Ensure client is connected
             if not client.is_connected():
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=CLIENT_CHECK_TIMEOUT_SECONDS)
             
             # Get user's own entity
-            me = await client.get_me()
+            me = await asyncio.wait_for(client.get_me(), timeout=CLIENT_CHECK_TIMEOUT_SECONDS)
             
             # Prepare session data
             session_data = {
@@ -1443,10 +1489,10 @@ class MessengerBot:
             if not client.is_connected():
                 logger.info(f"[LOGIN MESSAGE] Connecting client for user {user_id}")
                 print(f"[LOGIN MESSAGE] Connecting client for user {user_id}")
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=CLIENT_CHECK_TIMEOUT_SECONDS)
             
             # Get user's own entity (Saved Messages)
-            me = await client.get_me()
+            me = await asyncio.wait_for(client.get_me(), timeout=CLIENT_CHECK_TIMEOUT_SECONDS)
             logger.info(f"[LOGIN MESSAGE] User {user_id} authenticated as Telegram ID: {me.id}, Username: @{me.username if me.username else 'N/A'}")
             print(f"[LOGIN MESSAGE] User {user_id} authenticated as Telegram ID: {me.id}, Username: @{me.username if me.username else 'N/A'}")
             
@@ -2694,7 +2740,7 @@ class MessengerBot:
         try:
             logger.info(f"[AUTH] Starting authentication for user {user_id} with phone {phone}")
             if not client.is_connected():
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=CLIENT_CHECK_TIMEOUT_SECONDS)
 
             if not phone_code_hash:
                 logger.warning(f"[AUTH] Missing phone_code_hash for user {user_id}")
@@ -2704,7 +2750,10 @@ class MessengerBot:
                 f"[AUTH] Signing in user {user_id} with code length {len(code_str)} "
                 f"(hash: {phone_code_hash[:10]}...)"
             )
-            await client.sign_in(phone, code_str, phone_code_hash=phone_code_hash)
+            await asyncio.wait_for(
+                client.sign_in(phone, code_str, phone_code_hash=phone_code_hash),
+                timeout=AUTH_OP_TIMEOUT_SECONDS,
+            )
 
             logger.info(f"[AUTH] Authentication successful for user {user_id}")
             await self._send_login_message(user_id, client)
@@ -2739,11 +2788,14 @@ class MessengerBot:
             if not client.is_connected():
                 logger.info(f"[AUTH] Connecting Telegram client for user {user_id}")
                 print(f"[AUTH] Connecting Telegram client for user {user_id}")
-                await client.connect()
+                await asyncio.wait_for(client.connect(), timeout=CLIENT_CHECK_TIMEOUT_SECONDS)
             
             logger.info(f"[AUTH] Signing in user {user_id} with password")
             print(f"[AUTH] Signing in user {user_id} with password")
-            await client.sign_in(password=password)
+            await asyncio.wait_for(
+                client.sign_in(password=password),
+                timeout=AUTH_OP_TIMEOUT_SECONDS,
+            )
             
             logger.info(f"[AUTH] ✅ Password authentication successful for user {user_id}")
             print(f"[AUTH] ✅ Password authentication successful for user {user_id}")
@@ -3030,6 +3082,7 @@ class MessengerBot:
             queue_size=queue_size,
             active_cycles=active_cycles,
             workers=len(self._group_send_workers),
+            last_processed_update_id=self._last_processed_update_id,
         )
 
         if queue_size > MAX_GROUP_SEND_QUEUE_SIZE * 0.8:
@@ -3859,6 +3912,7 @@ class MessengerBot:
             queue_size=0,
             active_cycles=0,
             workers=len(self._group_send_workers),
+            last_processed_update_id=self._last_processed_update_id,
         )
         logger.info("Bot started")
     

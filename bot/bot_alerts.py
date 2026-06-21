@@ -32,6 +32,7 @@ def write_runtime_heartbeat(
     queue_size: int,
     active_cycles: int,
     workers: int,
+    last_processed_update_id: int = 0,
 ):
     _ensure_data_dir()
     payload = {
@@ -40,6 +41,7 @@ def write_runtime_heartbeat(
         "queue_size": queue_size,
         "active_cycles": active_cycles,
         "workers": workers,
+        "last_processed_update_id": last_processed_update_id,
     }
     with open(HEARTBEAT_FILE, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
